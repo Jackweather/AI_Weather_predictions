@@ -1,0 +1,610 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import logging
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+from zoneinfo import ZoneInfo
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib
+import numpy as np
+import pygrib
+import requests
+from matplotlib import pyplot as plt
+from matplotlib.colors import BoundaryNorm, ListedColormap
+
+matplotlib.use("Agg")
+
+BASE_DIR = Path("/var/data")
+BASE_URL = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+UTC = dt.timezone.utc
+EASTERN = ZoneInfo("America/New_York")
+MAX_DOWNLOAD_FORECAST_HOUR = 384
+DEFAULT_MAX_PLOT_FORECAST_HOUR = 336
+DEFAULT_SMOOTH_PASSES = 3
+DOWNLOAD_FORECAST_HOURS = tuple(range(6, MAX_DOWNLOAD_FORECAST_HOUR + 1, 6))
+CONUS_EXTENT = (-127.0, -66.0, 20.0, 54.0)
+LIGHT_CONFIDENCE_COLORS = [
+    "#e0f3ff",  # very light blue
+    "#9bd4ff",  # light blue
+    "#4fa3ff",  # blue
+
+    "#3bd16f",  # green
+    "#7fff00",  # bright green-yellow
+
+    "#ffe600",  # yellow
+    "#ffb300",  # orange
+
+    "#ff4d2d",  # red
+    "#cc1f1a",  # dark red
+
+    "#9b00ff",  # purple (extreme)
+]
+
+
+@dataclass(frozen=True)
+class RunCycle:
+    init_time: dt.datetime
+
+    def __post_init__(self) -> None:
+        if self.init_time.tzinfo is None:
+            object.__setattr__(self, "init_time", self.init_time.replace(tzinfo=UTC))
+        else:
+            object.__setattr__(self, "init_time", self.init_time.astimezone(UTC))
+
+    @property
+    def cycle_hour(self) -> int:
+        return self.init_time.hour
+
+    @property
+    def date_token(self) -> str:
+        return self.init_time.strftime("%Y%m%d")
+
+    @property
+    def tag(self) -> str:
+        return self.init_time.strftime("%Y%m%d_%HZ")
+
+    @property
+    def nomads_directory(self) -> str:
+        return f"/gfs.{self.date_token}/{self.cycle_hour:02d}/atmos"
+
+    def file_name(self, forecast_hour: int) -> str:
+        return f"gfs.t{self.cycle_hour:02d}z.pgrb2.0p25.f{forecast_hour:03d}"
+
+    def shifted(self, hours: int) -> "RunCycle":
+        return RunCycle(self.init_time + dt.timedelta(hours=hours))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download the newest complete GFS 0.25-degree run, collect prior runs, "
+            "and build 0-10 rain confidence maps from aligned precipitation forecasts."
+        )
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=BASE_DIR / "gfs_rain_confidence_output",
+        help="Directory used for downloaded GRIB files and generated plots.",
+    )
+    parser.add_argument(
+        "--history-runs",
+        type=int,
+        default=7,
+        help="How many previous 6-hour runs to compare against the current run.",
+    )
+    parser.add_argument(
+        "--retain-runs",
+        type=int,
+        default=8,
+        help="How many cycle folders to keep in grib and plots before deleting older ones.",
+    )
+    parser.add_argument(
+        "--cycle-lookback",
+        type=int,
+        default=8,
+        help="How many candidate cycles to search when looking for the latest complete run.",
+    )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=4,
+        help="Concurrent downloads per run.",
+    )
+    parser.add_argument(
+        "--rain-threshold-mmhr",
+        type=float,
+        default=0.10,
+        help="Rain threshold in mm/hr used to mark a grid point as wet.",
+    )
+    parser.add_argument(
+        "--smooth-passes",
+        type=int,
+        default=DEFAULT_SMOOTH_PASSES,
+        help="How many passes of spatial smoothing to apply before plotting. Higher values produce broader smoothing.",
+    )
+    parser.add_argument(
+        "--max-plot-forecast-hour",
+        type=int,
+        default=DEFAULT_MAX_PLOT_FORECAST_HOUR,
+        help="Highest forecast hour to render to PNGs. Must be a multiple of 6.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=180,
+        help="Seconds allowed for each NOMADS request.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Redownload files even if they already exist locally.",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Assume the required GRIB files already exist locally and only build plots.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity.",
+    )
+    return parser.parse_args()
+
+
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.history_runs < 0:
+        raise ValueError("--history-runs must be zero or greater.")
+    if args.retain_runs < 1:
+        raise ValueError("--retain-runs must be at least 1.")
+    if args.retain_runs < args.history_runs + 1:
+        raise ValueError("--retain-runs must be at least --history-runs + 1.")
+    if args.max_plot_forecast_hour < 6:
+        raise ValueError("--max-plot-forecast-hour must be at least 6.")
+    if args.max_plot_forecast_hour > MAX_DOWNLOAD_FORECAST_HOUR:
+        raise ValueError(
+            f"--max-plot-forecast-hour cannot exceed {MAX_DOWNLOAD_FORECAST_HOUR}."
+        )
+    if args.max_plot_forecast_hour % 6 != 0:
+        raise ValueError("--max-plot-forecast-hour must be a multiple of 6.")
+    if args.smooth_passes < 0:
+        raise ValueError("--smooth-passes must be zero or greater.")
+
+
+def build_plot_forecast_hours(max_forecast_hour: int) -> tuple[int, ...]:
+    return tuple(range(6, max_forecast_hour + 1, 6))
+
+
+def floor_to_cycle(timestamp: dt.datetime) -> RunCycle:
+    timestamp = timestamp.astimezone(UTC)
+    cycle_hour = (timestamp.hour // 6) * 6
+    floored = timestamp.replace(hour=cycle_hour, minute=0, second=0, microsecond=0)
+    return RunCycle(floored)
+
+
+def build_url(run_cycle: RunCycle, forecast_hour: int) -> str:
+    return requests.Request(
+        method="GET",
+        url=BASE_URL,
+        params={
+            "dir": run_cycle.nomads_directory,
+            "file": run_cycle.file_name(forecast_hour),
+            "var_PRATE": "on",
+            "lev_surface": "on",
+        },
+    ).prepare().url
+
+
+def local_grib_path(root: Path, run_cycle: RunCycle, forecast_hour: int) -> Path:
+    return root / "grib" / run_cycle.tag / f"{run_cycle.file_name(forecast_hour)}.grib2"
+
+
+def missing_forecast_hours(
+    root: Path,
+    run_cycle: RunCycle,
+    forecast_hours: Sequence[int],
+    overwrite: bool,
+) -> list[int]:
+    if overwrite:
+        return list(forecast_hours)
+
+    return [
+        forecast_hour
+        for forecast_hour in forecast_hours
+        if not local_grib_path(root, run_cycle, forecast_hour).exists()
+    ]
+
+
+def probe_file_available(run_cycle: RunCycle, forecast_hour: int, timeout: int) -> bool:
+    url = build_url(run_cycle, forecast_hour)
+    try:
+        response = requests.get(url, stream=True, timeout=timeout)
+    except requests.RequestException as exc:
+        logging.debug("Probe failed for %s f%03d: %s", run_cycle.tag, forecast_hour, exc)
+        return False
+
+    with response:
+        if response.status_code != 200:
+            return False
+        content_type = response.headers.get("Content-Type", "")
+        disposition = response.headers.get("Content-Disposition", "")
+        if "html" in content_type.lower() and ".grib2" not in disposition.lower():
+            return False
+        return True
+
+
+def resolve_latest_complete_cycle(now_utc: dt.datetime, lookback_cycles: int, timeout: int) -> RunCycle:
+    candidate = floor_to_cycle(now_utc)
+    for offset in range(lookback_cycles + 1):
+        run_cycle = candidate.shifted(hours=-6 * offset)
+        if probe_file_available(run_cycle, MAX_DOWNLOAD_FORECAST_HOUR, timeout):
+            logging.info("Selected latest complete run: %s", run_cycle.tag)
+            return run_cycle
+        logging.info("Run %s is not complete yet, falling back one cycle", run_cycle.tag)
+    raise RuntimeError("Could not find a complete recent GFS run within the configured lookback window.")
+
+
+def build_run_sequence(current_run: RunCycle, history_runs: int) -> list[RunCycle]:
+    return [current_run.shifted(hours=-6 * offset) for offset in range(history_runs + 1)]
+
+
+def prune_old_run_directories(root: Path, keep_runs: int) -> None:
+    if keep_runs < 1 or not root.exists():
+        return
+
+    run_directories = sorted(path for path in root.iterdir() if path.is_dir())
+    stale_directories = run_directories[:-keep_runs]
+    for stale_directory in stale_directories:
+        shutil.rmtree(stale_directory, ignore_errors=False)
+        logging.info("Deleted old run folder %s", stale_directory)
+
+
+def download_file(url: str, destination: Path, timeout: int, overwrite: bool) -> Path:
+    if destination.exists() and not overwrite:
+        return destination
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_suffix(destination.suffix + ".part")
+    for attempt in range(1, 4):
+        try:
+            with requests.get(url, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                with temp_path.open("wb") as file_handle:
+                    for chunk in response.iter_content(chunk_size=1_048_576):
+                        if chunk:
+                            file_handle.write(chunk)
+            temp_path.replace(destination)
+            return destination
+        except requests.RequestException as exc:
+            if temp_path.exists():
+                temp_path.unlink()
+            if attempt == 3:
+                raise RuntimeError(f"Failed to download {destination.name}: {exc}") from exc
+            time.sleep(2 * attempt)
+    return destination
+
+
+def download_run(
+    root: Path,
+    run_cycle: RunCycle,
+    forecast_hours: Sequence[int],
+    timeout: int,
+    overwrite: bool,
+    workers: int,
+) -> None:
+    hours_to_download = missing_forecast_hours(root, run_cycle, forecast_hours, overwrite)
+    if not hours_to_download:
+        logging.info("Skipping %s because all %d files already exist", run_cycle.tag, len(forecast_hours))
+        return
+
+    logging.info(
+        "Downloading %s (%d missing of %d files)",
+        run_cycle.tag,
+        len(hours_to_download),
+        len(forecast_hours),
+    )
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = []
+        for forecast_hour in hours_to_download:
+            url = build_url(run_cycle, forecast_hour)
+            destination = local_grib_path(root, run_cycle, forecast_hour)
+            futures.append(executor.submit(download_file, url, destination, timeout, overwrite))
+        for future in as_completed(futures):
+            future.result()
+
+
+def normalize_longitudes(
+    values: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if np.nanmax(lons) <= 180:
+        return values, lats, lons
+
+    adjusted_lons = np.where(lons > 180, lons - 360, lons)
+    sort_order = np.argsort(adjusted_lons[0, :])
+    return values[:, sort_order], lats[:, sort_order], adjusted_lons[:, sort_order]
+
+
+def load_prate_mmhr(grib_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    grib_handle = pygrib.open(str(grib_path))
+    try:
+        message = grib_handle.select(name="Precipitation rate")[0]
+        values = np.asarray(message.values, dtype=np.float32)
+        lats, lons = message.latlons()
+    finally:
+        grib_handle.close()
+
+    values = np.maximum(values, 0.0) * 3600.0
+    return normalize_longitudes(values, lats, lons)
+
+
+def valid_time(run_cycle: RunCycle, forecast_hour: int) -> dt.datetime:
+    return run_cycle.init_time + dt.timedelta(hours=forecast_hour)
+
+
+def build_plot_title(run_cycle: RunCycle, forecast_hour: int) -> str:
+    valid_local = valid_time(run_cycle, forecast_hour).astimezone(EASTERN)
+    hour_str_fmt = valid_local.strftime("%I:%M %p").lstrip("0")
+    day_of_week = valid_local.strftime("%A")
+    return (
+        f"Rain Confidence Forecast F{forecast_hour:03d}\n"
+        f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_str_fmt} ET"
+    )
+
+
+def build_plot_subtitle(run_cycle: RunCycle, forecast_hour: int, member_count: int) -> str:
+    return (
+        f"GFS 0.25deg | Run {run_cycle.tag} | Forecast Hour F{forecast_hour:03d} | "
+        f"Aligned Members {member_count}"
+    )
+
+
+def collect_aligned_members(
+    root: Path,
+    run_cycles: Sequence[RunCycle],
+    current_forecast_hour: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[tuple[str, int]]]:
+    member_arrays: list[np.ndarray] = []
+    metadata: list[tuple[str, int]] = []
+    lats: np.ndarray | None = None
+    lons: np.ndarray | None = None
+
+    for offset, run_cycle in enumerate(run_cycles):
+        aligned_hour = current_forecast_hour + (offset * 6)
+        if aligned_hour > MAX_DOWNLOAD_FORECAST_HOUR:
+            continue
+        grib_path = local_grib_path(root, run_cycle, aligned_hour)
+        if not grib_path.exists():
+            logging.warning("Missing aligned member for %s at f%03d", run_cycle.tag, aligned_hour)
+            continue
+        values, current_lats, current_lons = load_prate_mmhr(grib_path)
+        if lats is None or lons is None:
+            lats = current_lats
+            lons = current_lons
+        member_arrays.append(values)
+        metadata.append((run_cycle.tag, aligned_hour))
+
+    if not member_arrays or lats is None or lons is None:
+        raise RuntimeError(f"No aligned members were available for forecast hour f{current_forecast_hour:03d}.")
+
+    return np.stack(member_arrays, axis=0), lats, lons, metadata
+
+
+def calculate_confidence(
+    members_mmhr: np.ndarray,
+    rain_threshold_mmhr: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    wet_members = members_mmhr >= rain_threshold_mmhr
+    wet_count = wet_members.sum(axis=0)
+    wet_fraction = wet_members.mean(axis=0)
+    mean_rate = members_mmhr.mean(axis=0)
+
+    wet_sum = np.sum(np.where(wet_members, members_mmhr, 0.0), axis=0)
+    wet_mean_rate = np.where(wet_count > 0, wet_sum / wet_count, 0.0)
+
+    spread = members_mmhr.std(axis=0)
+    spread_ratio = np.where(wet_mean_rate > 0, spread / np.maximum(wet_mean_rate, 0.25), 1.0)
+    spread_penalty = np.clip(spread_ratio / 2.0, 0.0, 1.0)
+
+    confidence = 10.0 * wet_fraction * (1.0 - 0.55 * spread_penalty)
+    confidence = np.where(wet_count > 0, confidence, 0.0)
+    confidence = np.clip(confidence, 0.0, 10.0)
+
+    return confidence.astype(np.float32), mean_rate.astype(np.float32), wet_fraction.astype(np.float32), spread.astype(np.float32)
+
+
+def confidence_cmap() -> tuple[ListedColormap, BoundaryNorm]:
+    boundaries = np.arange(0, 11, 1)
+    cmap = ListedColormap(LIGHT_CONFIDENCE_COLORS, name="rain_confidence")
+    norm = BoundaryNorm(boundaries, cmap.N, clip=True)
+    return cmap, norm
+
+
+def smooth_field(field: np.ndarray, passes: int) -> np.ndarray:
+    if passes <= 0:
+        return field
+
+    smoothed = np.asarray(field, dtype=np.float32)
+    kernel_1d = np.array([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32)
+    kernel = np.outer(kernel_1d, kernel_1d)
+    kernel /= kernel.sum()
+    kernel_size = kernel.shape[0]
+    pad_width = kernel_size // 2
+
+    for _ in range(passes):
+        padded = np.pad(smoothed, ((pad_width, pad_width), (pad_width, pad_width)), mode="edge")
+        next_field = np.zeros_like(smoothed)
+        for row_offset in range(kernel_size):
+            for col_offset in range(kernel_size):
+                next_field += (
+                    padded[
+                        row_offset : row_offset + smoothed.shape[0],
+                        col_offset : col_offset + smoothed.shape[1],
+                    ]
+                    * kernel[row_offset, col_offset]
+                )
+        smoothed = next_field
+
+    return smoothed
+
+
+def plot_confidence_map(
+    save_path: Path,
+    run_cycle: RunCycle,
+    forecast_hour: int,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    confidence: np.ndarray,
+    mean_rate: np.ndarray,
+    member_count: int,
+    rain_threshold_mmhr: float,
+    smooth_passes: int,
+) -> None:
+    smoothed_confidence = np.clip(smooth_field(confidence, smooth_passes), 0.0, 10.0)
+    smoothed_mean_rate = np.maximum(smooth_field(mean_rate, smooth_passes), 0.0)
+    projected_confidence = np.ma.masked_where(
+        smoothed_mean_rate < rain_threshold_mmhr,
+        smoothed_confidence,
+    )
+    cmap, norm = confidence_cmap()
+
+    figure = plt.figure(figsize=(15, 9))
+    axis = plt.axes(projection=ccrs.PlateCarree())
+    axis.set_extent(CONUS_EXTENT, crs=ccrs.PlateCarree())
+    axis.coastlines(linewidth=0.7)
+    axis.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5)
+    axis.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.3)
+
+    filled = axis.contourf(
+        lons,
+        lats,
+        projected_confidence,
+        levels=np.arange(0, 11, 1),
+        cmap=cmap,
+        norm=norm,
+        extend="max",
+        transform=ccrs.PlateCarree(),
+    )
+
+    axis.set_title(
+        build_plot_title(run_cycle, forecast_hour),
+        fontsize=16,
+        color="#3b4a5a",
+        pad=10,
+        loc="left",
+        fontweight="normal",
+    )
+
+    colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02)
+    colorbar.set_label("Rain confidence (0-10)")
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def build_confidence_products(
+    root: Path,
+    run_cycle: RunCycle,
+    run_cycles: Sequence[RunCycle],
+    plot_forecast_hours: Sequence[int],
+    rain_threshold_mmhr: float,
+    smooth_passes: int,
+) -> None:
+    plot_root = root / "plots" / run_cycle.tag
+    for forecast_hour in plot_forecast_hours:
+        members, lats, lons, metadata = collect_aligned_members(root, run_cycles, forecast_hour)
+        confidence, mean_rate, _, _ = calculate_confidence(members, rain_threshold_mmhr)
+        save_path = plot_root / f"rain_confidence_f{forecast_hour:03d}.png"
+        plot_confidence_map(
+            save_path=save_path,
+            run_cycle=run_cycle,
+            forecast_hour=forecast_hour,
+            lats=lats,
+            lons=lons,
+            confidence=confidence,
+            mean_rate=mean_rate,
+            member_count=len(metadata),
+            rain_threshold_mmhr=rain_threshold_mmhr,
+            smooth_passes=smooth_passes,
+        )
+        logging.info("Saved %s", save_path)
+
+
+def ensure_complete_history(
+    run_cycles: Iterable[RunCycle],
+    timeout: int,
+) -> None:
+    for run_cycle in run_cycles:
+        if not probe_file_available(run_cycle, MAX_DOWNLOAD_FORECAST_HOUR, timeout):
+            raise RuntimeError(
+                f"Run {run_cycle.tag} does not appear complete on NOMADS. "
+                "Reduce --history-runs or wait for older runs to become fully available."
+            )
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    setup_logging(args.log_level)
+    now_utc = dt.datetime.now(tz=UTC)
+    plot_forecast_hours = build_plot_forecast_hours(args.max_plot_forecast_hour)
+    output_root = args.output_root.resolve()
+
+    # Enforce retention on existing data before any new work begins.
+    prune_old_run_directories(output_root / "grib", args.retain_runs)
+    prune_old_run_directories(output_root / "plots", args.retain_runs)
+
+    current_run = resolve_latest_complete_cycle(now_utc, args.cycle_lookback, args.request_timeout)
+    run_cycles = build_run_sequence(current_run, args.history_runs)
+    ensure_complete_history(run_cycles, args.request_timeout)
+
+    logging.info("Output root: %s", output_root)
+    logging.info("Current run: %s", current_run.tag)
+    logging.info("Comparison runs: %s", ", ".join(run_cycle.tag for run_cycle in run_cycles[1:]))
+
+    if not args.skip_download:
+        for run_cycle in run_cycles:
+            download_run(
+                root=output_root,
+                run_cycle=run_cycle,
+                forecast_hours=DOWNLOAD_FORECAST_HOURS,
+                timeout=args.request_timeout,
+                overwrite=args.overwrite,
+                workers=args.download_workers,
+            )
+        prune_old_run_directories(output_root / "grib", args.retain_runs)
+
+    build_confidence_products(
+        root=output_root,
+        run_cycle=current_run,
+        run_cycles=run_cycles,
+        plot_forecast_hours=plot_forecast_hours,
+        rain_threshold_mmhr=args.rain_threshold_mmhr,
+        smooth_passes=max(0, args.smooth_passes),
+    )
+    prune_old_run_directories(output_root / "plots", args.retain_runs)
+
+    logging.info("Finished building confidence maps for %s", current_run.tag)
+
+
+if __name__ == "__main__":
+    main()
