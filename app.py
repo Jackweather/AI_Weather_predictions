@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,12 +13,76 @@ from flask import Flask, abort, jsonify, render_template, request, send_from_dir
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent))
 APP_ROOT = Path(__file__).resolve().parent
-BASE_DIR = Path("/var/data")
-DATA_ROOT = Path(os.environ.get("GFS_RAIN_CONFIDENCE_ROOT", str(BASE_DIR / "gfs_rain_confidence_output"))).expanduser().resolve()
+
+
+def default_data_root() -> Path:
+    configured_root = os.environ.get("GFS_RAIN_CONFIDENCE_ROOT")
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+
+    linux_data_root = Path("/var/data")
+    if os.name != "nt" and linux_data_root.is_dir():
+        return (linux_data_root / "gfs_rain_confidence_output").resolve()
+
+    return (APP_ROOT / "gfs_rain_confidence_output").resolve()
+
+
+DATA_ROOT = default_data_root()
 PLOTS_ROOT = DATA_ROOT / "plots"
+LOGS_ROOT = APP_ROOT / "logs"
 PNG_PATTERN = re.compile(r"f(\d{3})", re.IGNORECASE)
 RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{2}z$", re.IGNORECASE)
 EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def run_scripts(
+    scripts: list[tuple[str, str]],
+    retries: int,
+    parallel: bool = False,
+    max_parallel: int = 3,
+) -> None:
+    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def run_single_script(script_path: str, working_dir: str) -> None:
+        script_name = Path(script_path).stem
+        log_path = LOGS_ROOT / f"{script_name}.log"
+        attempts = max(1, retries)
+
+        for attempt in range(1, attempts + 1):
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\n[{datetime.now(timezone.utc).isoformat()}] attempt {attempt}\n")
+                completed = subprocess.run(
+                    ["python", script_path],
+                    cwd=working_dir,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+
+            if completed.returncode == 0:
+                return
+
+        raise RuntimeError(f"Script failed after {attempts} attempts: {script_path}")
+
+    if parallel and len(scripts) > 1:
+        workers = max(1, min(max_parallel, len(scripts)))
+        threads: list[threading.Thread] = []
+        for script_path, working_dir in scripts:
+            thread = threading.Thread(target=run_single_script, args=(script_path, working_dir), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+            while sum(thread_item.is_alive() for thread_item in threads) >= workers:
+                for thread_item in threads:
+                    thread_item.join(timeout=0.1)
+
+        for thread in threads:
+            thread.join()
+        return
+
+    for script_path, working_dir in scripts:
+        run_single_script(script_path, working_dir)
 
 
 def parse_run_id(run_id: str) -> datetime | None:
@@ -141,6 +207,7 @@ def index() -> str:
     )
 
 
+
 @app.route("/api/runs")
 def api_runs():
     runs = list_runs()
@@ -151,6 +218,20 @@ def api_runs():
 def api_images():
     images, resolved_run_id = list_images(request.args.get("run"))
     return jsonify({"images": images, "run_id": resolved_run_id})
+
+
+@app.route("/run-task1")
+def run_task1():
+    scripts = [
+        ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        
+        
+    ]
+    threading.Thread(
+        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=3),
+        daemon=True,
+    ).start()
+    return "Task started in background! Check logs folder for output.", 200
 
 
 @app.route("/images/<run_id>/<path:filename>")
