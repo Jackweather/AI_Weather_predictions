@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import email.utils
 import logging
+import random
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -29,8 +32,12 @@ EASTERN = ZoneInfo("America/New_York")
 MAX_DOWNLOAD_FORECAST_HOUR = 384
 DEFAULT_MAX_PLOT_FORECAST_HOUR = 336
 DEFAULT_SMOOTH_PASSES = 3
+DEFAULT_DOWNLOAD_WORKERS = 2
+DEFAULT_REQUEST_MIN_INTERVAL = 0.5
+DEFAULT_MAX_REQUEST_RETRIES = 6
 DOWNLOAD_FORECAST_HOURS = tuple(range(6, MAX_DOWNLOAD_FORECAST_HOUR + 1, 6))
 CONUS_EXTENT = (-127.0, -66.0, 20.0, 54.0)
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 LIGHT_CONFIDENCE_COLORS = [
     "#e0f3ff",  # very light blue
     "#9bd4ff",  # light blue
@@ -98,6 +105,135 @@ class RunCycle:
         return RunCycle(self.init_time + dt.timedelta(hours=hours))
 
 
+class NomadsClient:
+    def __init__(
+        self,
+        timeout: int,
+        min_interval_seconds: float,
+        max_retries: int,
+    ) -> None:
+        self.timeout = timeout
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self._last_request_started = 0.0
+        self._rate_lock = threading.Lock()
+        self._thread_local = threading.local()
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "User-Agent": "gfs-rain-confidence/1.0 (+https://nomads.ncep.noaa.gov/)",
+                    "Accept": "*/*",
+                }
+            )
+            self._thread_local.session = session
+        return session
+
+    def _throttle(self) -> None:
+        if self.min_interval_seconds <= 0:
+            return
+
+        with self._rate_lock:
+            now = time.monotonic()
+            wait_seconds = self.min_interval_seconds - (now - self._last_request_started)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+                now = time.monotonic()
+            self._last_request_started = now
+
+    def _retry_delay(self, attempt: int, response: requests.Response | None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(float(retry_after), self.min_interval_seconds)
+                except ValueError:
+                    retry_after_dt = email.utils.parsedate_to_datetime(retry_after)
+                    if retry_after_dt is not None:
+                        if retry_after_dt.tzinfo is None:
+                            retry_after_dt = retry_after_dt.replace(tzinfo=UTC)
+                        delay = (retry_after_dt.astimezone(UTC) - dt.datetime.now(tz=UTC)).total_seconds()
+                        return max(delay, self.min_interval_seconds)
+
+        base_delay = max(self.min_interval_seconds, 1.0)
+        backoff = min(90.0, base_delay * (2 ** (attempt - 1)))
+        jitter = random.uniform(0.0, max(0.25, self.min_interval_seconds))
+        return backoff + jitter
+
+    def request(self, method: str, url: str, *, stream: bool = False) -> requests.Response:
+        last_error: Exception | None = None
+        response: requests.Response | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            self._throttle()
+            try:
+                response = self._get_session().request(
+                    method=method,
+                    url=url,
+                    stream=stream,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == self.max_retries:
+                    break
+                delay = self._retry_delay(attempt, None)
+                logging.warning(
+                    "Request error for %s on attempt %d/%d: %s. Retrying in %.1fs",
+                    url,
+                    attempt,
+                    self.max_retries,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+
+            if response.status_code not in RETRYABLE_STATUS_CODES:
+                return response
+
+            if attempt == self.max_retries:
+                return response
+
+            delay = self._retry_delay(attempt, response)
+            logging.warning(
+                "Received HTTP %s for %s on attempt %d/%d. Retrying in %.1fs",
+                response.status_code,
+                url,
+                attempt,
+                self.max_retries,
+                delay,
+            )
+            response.close()
+            time.sleep(delay)
+
+        raise RuntimeError(f"Request failed for {url}: {last_error}") from last_error
+
+
+def response_contains_grib_payload(response: requests.Response) -> bool:
+    content_type = response.headers.get("Content-Type", "")
+    disposition = response.headers.get("Content-Disposition", "")
+    if response.status_code != 200:
+        return False
+    if "html" in content_type.lower() and ".grib2" not in disposition.lower():
+        return False
+    return True
+
+
+def assert_grib_payload(response: requests.Response, file_label: str) -> None:
+    if response_contains_grib_payload(response):
+        return
+
+    content_type = response.headers.get("Content-Type", "")
+    raise RuntimeError(
+        f"Unexpected response while fetching {file_label}: HTTP {response.status_code}, "
+        f"content type {content_type or 'unknown'}."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -132,8 +268,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--download-workers",
         type=int,
-        default=4,
+        default=DEFAULT_DOWNLOAD_WORKERS,
         help="Concurrent downloads per run.",
+    )
+    parser.add_argument(
+        "--request-min-interval",
+        type=float,
+        default=DEFAULT_REQUEST_MIN_INTERVAL,
+        help="Minimum seconds between outbound NOMADS requests across all worker threads.",
+    )
+    parser.add_argument(
+        "--max-request-retries",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_RETRIES,
+        help="How many times to retry NOMADS requests after rate limiting or transient server errors.",
     )
     parser.add_argument(
         "--rain-threshold-mmhr",
@@ -186,6 +334,12 @@ def setup_logging(level: str) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.download_workers < 1:
+        raise ValueError("--download-workers must be at least 1.")
+    if args.request_min_interval < 0:
+        raise ValueError("--request-min-interval must be zero or greater.")
+    if args.max_request_retries < 1:
+        raise ValueError("--max-request-retries must be at least 1.")
     if args.history_runs < 0:
         raise ValueError("--history-runs must be zero or greater.")
     if args.retain_runs < 1:
@@ -248,29 +402,23 @@ def missing_forecast_hours(
     ]
 
 
-def probe_file_available(run_cycle: RunCycle, forecast_hour: int, timeout: int) -> bool:
+def probe_file_available(client: NomadsClient, run_cycle: RunCycle, forecast_hour: int) -> bool:
     url = build_url(run_cycle, forecast_hour)
     try:
-        response = requests.get(url, stream=True, timeout=timeout)
-    except requests.RequestException as exc:
+        response = client.request("GET", url, stream=True)
+    except RuntimeError as exc:
         logging.debug("Probe failed for %s f%03d: %s", run_cycle.tag, forecast_hour, exc)
         return False
 
     with response:
-        if response.status_code != 200:
-            return False
-        content_type = response.headers.get("Content-Type", "")
-        disposition = response.headers.get("Content-Disposition", "")
-        if "html" in content_type.lower() and ".grib2" not in disposition.lower():
-            return False
-        return True
+        return response_contains_grib_payload(response)
 
 
-def resolve_latest_complete_cycle(now_utc: dt.datetime, lookback_cycles: int, timeout: int) -> RunCycle:
+def resolve_latest_complete_cycle(now_utc: dt.datetime, lookback_cycles: int, client: NomadsClient) -> RunCycle:
     candidate = floor_to_cycle(now_utc)
     for offset in range(lookback_cycles + 1):
         run_cycle = candidate.shifted(hours=-6 * offset)
-        if probe_file_available(run_cycle, MAX_DOWNLOAD_FORECAST_HOUR, timeout):
+        if probe_file_available(client, run_cycle, MAX_DOWNLOAD_FORECAST_HOUR):
             logging.info("Selected latest complete run: %s", run_cycle.tag)
             return run_cycle
         logging.info("Run %s is not complete yet, falling back one cycle", run_cycle.tag)
@@ -292,36 +440,37 @@ def prune_old_run_directories(root: Path, keep_runs: int) -> None:
         logging.info("Deleted old run folder %s", stale_directory)
 
 
-def download_file(url: str, destination: Path, timeout: int, overwrite: bool) -> Path:
+def download_file(
+    client: NomadsClient,
+    url: str,
+    destination: Path,
+    overwrite: bool,
+) -> Path:
     if destination.exists() and not overwrite:
         return destination
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_suffix(destination.suffix + ".part")
-    for attempt in range(1, 4):
-        try:
-            with requests.get(url, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                with temp_path.open("wb") as file_handle:
-                    for chunk in response.iter_content(chunk_size=1_048_576):
-                        if chunk:
-                            file_handle.write(chunk)
-            temp_path.replace(destination)
-            return destination
-        except requests.RequestException as exc:
-            if temp_path.exists():
-                temp_path.unlink()
-            if attempt == 3:
-                raise RuntimeError(f"Failed to download {destination.name}: {exc}") from exc
-            time.sleep(2 * attempt)
+    try:
+        with client.request("GET", url, stream=True) as response:
+            assert_grib_payload(response, destination.name)
+            with temp_path.open("wb") as file_handle:
+                for chunk in response.iter_content(chunk_size=1_048_576):
+                    if chunk:
+                        file_handle.write(chunk)
+        temp_path.replace(destination)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
     return destination
 
 
 def download_run(
+    client: NomadsClient,
     root: Path,
     run_cycle: RunCycle,
     forecast_hours: Sequence[int],
-    timeout: int,
     overwrite: bool,
     workers: int,
 ) -> None:
@@ -341,7 +490,7 @@ def download_run(
         for forecast_hour in hours_to_download:
             url = build_url(run_cycle, forecast_hour)
             destination = local_grib_path(root, run_cycle, forecast_hour)
-            futures.append(executor.submit(download_file, url, destination, timeout, overwrite))
+            futures.append(executor.submit(download_file, client, url, destination, overwrite))
         for future in as_completed(futures):
             future.result()
 
@@ -625,10 +774,10 @@ def build_confidence_products(
 
 def ensure_complete_history(
     run_cycles: Iterable[RunCycle],
-    timeout: int,
+    client: NomadsClient,
 ) -> None:
     for run_cycle in run_cycles:
-        if not probe_file_available(run_cycle, MAX_DOWNLOAD_FORECAST_HOUR, timeout):
+        if not probe_file_available(client, run_cycle, MAX_DOWNLOAD_FORECAST_HOUR):
             raise RuntimeError(
                 f"Run {run_cycle.tag} does not appear complete on NOMADS. "
                 "Reduce --history-runs or wait for older runs to become fully available."
@@ -642,14 +791,19 @@ def main() -> None:
     now_utc = dt.datetime.now(tz=UTC)
     plot_forecast_hours = build_plot_forecast_hours(args.max_plot_forecast_hour)
     output_root = args.output_root.resolve()
+    client = NomadsClient(
+        timeout=args.request_timeout,
+        min_interval_seconds=args.request_min_interval,
+        max_retries=args.max_request_retries,
+    )
 
     # Enforce retention on existing data before any new work begins.
     prune_old_run_directories(output_root / "grib", args.retain_runs)
     prune_old_run_directories(output_root / "plots", args.retain_runs)
 
-    current_run = resolve_latest_complete_cycle(now_utc, args.cycle_lookback, args.request_timeout)
+    current_run = resolve_latest_complete_cycle(now_utc, args.cycle_lookback, client)
     run_cycles = build_run_sequence(current_run, args.history_runs)
-    ensure_complete_history(run_cycles, args.request_timeout)
+    ensure_complete_history(run_cycles, client)
 
     logging.info("Output root: %s", output_root)
     logging.info("Current run: %s", current_run.tag)
@@ -658,10 +812,10 @@ def main() -> None:
     if not args.skip_download:
         for run_cycle in run_cycles:
             download_run(
+                client=client,
                 root=output_root,
                 run_cycle=run_cycle,
                 forecast_hours=DOWNLOAD_FORECAST_HOURS,
-                timeout=args.request_timeout,
                 overwrite=args.overwrite,
                 workers=args.download_workers,
             )
