@@ -15,8 +15,8 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib
 import numpy as np
-import pygrib
 import requests
+import xarray as xr
 from matplotlib import pyplot as plt
 from matplotlib.colors import BoundaryNorm, ListedColormap
 
@@ -47,6 +47,12 @@ LIGHT_CONFIDENCE_COLORS = [
 
     "#9b00ff",  # purple (extreme)
 ]
+
+CFGRIB_BACKEND_KWARGS = (
+    {"filter_by_keys": {"shortName": "prate", "typeOfLevel": "surface"}, "indexpath": ""},
+    {"filter_by_keys": {"typeOfLevel": "surface"}, "indexpath": ""},
+    {"indexpath": ""},
+)
 
 
 @dataclass(frozen=True)
@@ -343,14 +349,72 @@ def normalize_longitudes(
     return values[:, sort_order], lats[:, sort_order], adjusted_lons[:, sort_order]
 
 
+def build_coordinate_grids(dataset: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
+    latitude = dataset.coords.get("latitude")
+    if latitude is None:
+        latitude = dataset.coords.get("lat")
+
+    longitude = dataset.coords.get("longitude")
+    if longitude is None:
+        longitude = dataset.coords.get("lon")
+
+    if latitude is None or longitude is None:
+        raise ValueError("GRIB dataset is missing latitude/longitude coordinates.")
+
+    lat_values = np.asarray(latitude.values, dtype=np.float32)
+    lon_values = np.asarray(longitude.values, dtype=np.float32)
+    if lat_values.ndim == 1 and lon_values.ndim == 1:
+        lon_grid, lat_grid = np.meshgrid(lon_values, lat_values)
+        return lat_grid.astype(np.float32), lon_grid.astype(np.float32)
+    if lat_values.ndim == 2 and lon_values.ndim == 2:
+        return lat_values, lon_values
+
+    raise ValueError(
+        "Unsupported GRIB coordinate layout: expected 1D or 2D latitude/longitude arrays."
+    )
+
+
+def select_precipitation_rate(dataset: xr.Dataset) -> xr.DataArray:
+    if "prate" in dataset.data_vars:
+        return dataset["prate"].squeeze(drop=True)
+
+    for variable in dataset.data_vars.values():
+        if variable.attrs.get("GRIB_name") == "Precipitation rate":
+            return variable.squeeze(drop=True)
+        if variable.attrs.get("GRIB_shortName") == "prate":
+            return variable.squeeze(drop=True)
+
+    if len(dataset.data_vars) == 1:
+        return next(iter(dataset.data_vars.values())).squeeze(drop=True)
+
+    raise ValueError("Could not locate a precipitation-rate field in the GRIB dataset.")
+
+
 def load_prate_mmhr(grib_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    grib_handle = pygrib.open(str(grib_path))
-    try:
-        message = grib_handle.select(name="Precipitation rate")[0]
-        values = np.asarray(message.values, dtype=np.float32)
-        lats, lons = message.latlons()
-    finally:
-        grib_handle.close()
+    dataset: xr.Dataset | None = None
+    last_error: Exception | None = None
+
+    for backend_kwargs in CFGRIB_BACKEND_KWARGS:
+        try:
+            dataset = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs=backend_kwargs)
+            data_array = select_precipitation_rate(dataset)
+            values = np.asarray(data_array.values, dtype=np.float32)
+            if values.ndim != 2:
+                raise ValueError(
+                    f"Expected a 2D precipitation field in {grib_path.name}, got shape {values.shape}."
+                )
+            lats, lons = build_coordinate_grids(dataset)
+            break
+        except Exception as exc:
+            last_error = exc
+            if dataset is not None:
+                dataset.close()
+                dataset = None
+    else:
+        raise RuntimeError(f"Unable to read precipitation rate from {grib_path.name}: {last_error}") from last_error
+
+    assert dataset is not None
+    dataset.close()
 
     values = np.maximum(values, 0.0) * 3600.0
     return normalize_longitudes(values, lats, lons)
@@ -365,7 +429,7 @@ def build_plot_title(run_cycle: RunCycle, forecast_hour: int) -> str:
     hour_str_fmt = valid_local.strftime("%I:%M %p").lstrip("0")
     day_of_week = valid_local.strftime("%A")
     return (
-        f"Rain Confidence Forecast F{forecast_hour:03d}\n"
+        f"Precip Confidence Forecast F{forecast_hour:03d}\n"
         f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_str_fmt} ET"
     )
 
@@ -514,7 +578,7 @@ def plot_confidence_map(
     )
 
     colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02)
-    colorbar.set_label("Rain confidence (0-10)")
+    colorbar.set_label("R confidence (0-10)")
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(save_path, dpi=160, bbox_inches="tight")
