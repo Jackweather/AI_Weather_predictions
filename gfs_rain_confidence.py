@@ -49,7 +49,17 @@ LIGHT_CONFIDENCE_COLORS = [
 ]
 
 CFGRIB_BACKEND_KWARGS = (
+    {
+        "filter_by_keys": {"shortName": "prate", "typeOfLevel": "surface", "stepType": "instant"},
+        "indexpath": "",
+    },
+    {
+        "filter_by_keys": {"shortName": "prate", "typeOfLevel": "surface", "stepType": "avg"},
+        "indexpath": "",
+    },
     {"filter_by_keys": {"shortName": "prate", "typeOfLevel": "surface"}, "indexpath": ""},
+    {"filter_by_keys": {"typeOfLevel": "surface", "stepType": "instant"}, "indexpath": ""},
+    {"filter_by_keys": {"typeOfLevel": "surface", "stepType": "avg"}, "indexpath": ""},
     {"filter_by_keys": {"typeOfLevel": "surface"}, "indexpath": ""},
     {"indexpath": ""},
 )
