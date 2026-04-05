@@ -289,24 +289,19 @@ def start_background_script(script_name: str):
 
 @app.route("/run-task1")
 def run_task1():
-    return start_background_script("gfs_rain_confidence.py")
+    scripts = [
+        ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_rain_confidence_ai.py", "/opt/render/project/src"),
 
+        
+        
+    ]
+    threading.Thread(
+        target=lambda: run_scripts(scripts, 2, parallel=True, max_parallel=1),
+        daemon=True,
+    ).start()
+    return "Task started in background! Check logs folder for output.", 200
 
-@app.route("/run-baseline-task")
-def run_baseline_task():
-    return start_background_script("gfs_rain_confidence.py")
-
-
-@app.route("/run-ai-task")
-def run_ai_task():
-    return start_background_script("gfs_rain_confidence_ai.py")
-
-
-@app.route("/images/<run_id>/<path:filename>")
-def serve_image(run_id: str, filename: str):
-    run_dir = get_run_directory(run_id, request.args.get("product"))
-    if run_dir is None:
-        abort(404)
 
     image_path = (run_dir / filename).resolve()
     try:
