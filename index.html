@@ -242,16 +242,6 @@
             font-weight: 600;
         }
 
-        .task-status {
-            min-height: 18px;
-            font-size: 0.76rem;
-            color: var(--muted);
-        }
-
-        .task-status.is-error {
-            color: #ff9580;
-        }
-
         @keyframes spin {
             to {
                 transform: rotate(360deg);
@@ -324,8 +314,8 @@
                         {% endfor %}
                     </select>
                 </div>
-                <button id="runBaselineButton" class="nav-button" type="button">Build Baseline</button>
-                <button id="runAiButton" class="nav-button" type="button">Build AI</button>
+                <button id="prevButton" class="nav-button" type="button">Previous</button>
+                <button id="nextButton" class="nav-button" type="button">Next</button>
             </div>
             <div class="control-row">
                 <div class="run-row">
@@ -335,8 +325,8 @@
                         {% endfor %}
                     </select>
                 </div>
-                <button id="prevButton" class="nav-button" type="button">Previous</button>
-                <button id="nextButton" class="nav-button" type="button">Next</button>
+                <div></div>
+                <div></div>
             </div>
             <div class="slider-row">
                 <input id="frameSlider" type="range" min="0" max="{{ image_count - 1 if image_count else 0 }}" value="0" {% if not images %}disabled{% endif %}>
@@ -346,7 +336,6 @@
                 <div id="runStatus">Product: {{ selected_product_label }} | Run: {{ selected_run_label }}</div>
                 <div id="frameLabel">{% if images %}{{ images[0].label }}{% else %}Use the slider or arrow keys to change frames.{% endif %}</div>
             </div>
-            <div id="taskStatus" class="task-status" aria-live="polite"></div>
         </section>
     </div>
 
@@ -378,9 +367,6 @@
         const frameLabel = document.getElementById("frameLabel");
         const prevButton = document.getElementById("prevButton");
         const nextButton = document.getElementById("nextButton");
-        const runBaselineButton = document.getElementById("runBaselineButton");
-        const runAiButton = document.getElementById("runAiButton");
-        const taskStatus = document.getElementById("taskStatus");
         const imagePreloadCache = new Map();
         let currentIndex = 0;
         let activeLoadToken = 0;
@@ -462,11 +448,6 @@
             runStatus.textContent = selectedRunId
                 ? `Product: ${getProductLabel(selectedProductId)} | Run: ${getRunLabel(selectedRunId)}`
                 : `Product: ${getProductLabel(selectedProductId)} | No saved runs`;
-        }
-
-        function setTaskStatus(message, isError = false) {
-            taskStatus.textContent = message ?? "";
-            taskStatus.classList.toggle("is-error", Boolean(isError));
         }
 
         function setLoadingProgress(loadedCount, totalCount) {
@@ -729,23 +710,6 @@
             }
         }
 
-        async function startProductTask(productId, endpoint, label) {
-            selectedProductId = productId;
-            syncProductSelect();
-            updateRunStatus();
-            setTaskStatus(`Starting ${label} generation...`);
-
-            try {
-                const response = await fetch(endpoint, { cache: "no-store" });
-                const payload = await response.json();
-                setTaskStatus(payload.message ?? `${label} started.`, !response.ok);
-                followingLatestRun = true;
-                await refreshRunsAndImages();
-            } catch {
-                setTaskStatus(`${label} failed to start.`, true);
-            }
-        }
-
         syncProductSelect();
         syncRunSelect();
         updateRunStatus();
@@ -776,16 +740,7 @@
             selectedProductId = event.target.value;
             selectedRunId = null;
             followingLatestRun = true;
-            setTaskStatus("");
             refreshRunsAndImages();
-        });
-
-        runBaselineButton?.addEventListener("click", () => {
-            startProductTask("baseline", "/run-baseline-task", "baseline");
-        });
-
-        runAiButton?.addEventListener("click", () => {
-            startProductTask("ai", "/run-ai-task", "AI");
         });
 
         document.addEventListener("keydown", event => {
