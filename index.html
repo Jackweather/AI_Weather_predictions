@@ -188,6 +188,10 @@
             min-width: 0;
         }
 
+        .product-row {
+            max-width: 220px;
+        }
+
         .run-select,
         .nav-button {
             width: 100%;
@@ -197,6 +201,12 @@
             color: var(--text);
             padding: 8px 10px;
             font-size: 0.84rem;
+        }
+
+        .product-select {
+            padding: 6px 9px;
+            font-size: 0.78rem;
+            max-width: 220px;
         }
 
         .nav-button {
@@ -307,15 +317,13 @@
 
         <section class="controls">
             <div class="control-row">
-                <div class="run-row">
-                    <select id="productSelect" class="run-select" aria-label="Product">
+                <div class="run-row product-row">
+                    <select id="productSelect" class="run-select product-select" aria-label="Product">
                         {% for product in products %}
                         <option value="{{ product.id }}" {% if product.id == selected_product %}selected{% endif %}>{{ product.label }}</option>
                         {% endfor %}
                     </select>
                 </div>
-                <button id="prevButton" class="nav-button" type="button">Previous</button>
-                <button id="nextButton" class="nav-button" type="button">Next</button>
             </div>
             <div class="control-row">
                 <div class="run-row">
@@ -325,8 +333,6 @@
                         {% endfor %}
                     </select>
                 </div>
-                <div></div>
-                <div></div>
             </div>
             <div class="slider-row">
                 <input id="frameSlider" type="range" min="0" max="{{ image_count - 1 if image_count else 0 }}" value="0" {% if not images %}disabled{% endif %}>
@@ -365,8 +371,6 @@
         const runSelect = document.getElementById("runSelect");
         const runStatus = document.getElementById("runStatus");
         const frameLabel = document.getElementById("frameLabel");
-        const prevButton = document.getElementById("prevButton");
-        const nextButton = document.getElementById("nextButton");
         const imagePreloadCache = new Map();
         let currentIndex = 0;
         let activeLoadToken = 0;
@@ -504,8 +508,6 @@
         function syncSlider() {
             slider.max = Math.max(images.length - 1, 0);
             slider.disabled = images.length === 0;
-            prevButton.disabled = images.length <= 1 || currentIndex === 0;
-            nextButton.disabled = images.length <= 1 || currentIndex >= images.length - 1;
         }
 
         function updateFrame(index) {
@@ -720,14 +722,6 @@
 
         slider.addEventListener("change", event => {
             queueFrameRequest(Number(event.target.value));
-        });
-
-        prevButton.addEventListener("click", () => {
-            queueFrameRequest(Math.max(Number(slider.value) - 1, 0));
-        });
-
-        nextButton.addEventListener("click", () => {
-            queueFrameRequest(Math.min(Number(slider.value) + 1, images.length - 1));
         });
 
         runSelect?.addEventListener("change", event => {
