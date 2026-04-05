@@ -294,6 +294,21 @@ def start_background_script(script_name: str):
 def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_rain_confidence_ai.py", "/opt/render/project/src"),
+
+        
+        
+    ]
+    threading.Thread(
+        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=1),
+        daemon=True,
+    ).start()
+    return "Task started in background! Check logs folder for output.", 200
+
+@app.route("/run-task2")
+def run_task2():
+    scripts = [
+        ("/opt/render/project/src/mrms_feedback_collector.py", "/opt/render/project/src"),
 
         
         
@@ -303,7 +318,6 @@ def run_task1():
         daemon=True,
     ).start()
     return "Task started in background! Check logs folder for output.", 200
-
 
 @app.route("/images/<run_id>/<path:filename>")
 def serve_image(run_id: str, filename: str):
