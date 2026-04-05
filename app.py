@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,56 +38,6 @@ LOGS_ROOT = APP_ROOT / "logs"
 PNG_PATTERN = re.compile(r"f(\d{3})", re.IGNORECASE)
 RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{2}z$", re.IGNORECASE)
 EASTERN_TZ = ZoneInfo("America/New_York")
-
-
-def run_scripts(
-    scripts: list[tuple[str, str]],
-    retries: int,
-    parallel: bool = False,
-    max_parallel: int = 3,
-) -> None:
-    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
-
-    def run_single_script(script_path: str, working_dir: str) -> None:
-        script_name = Path(script_path).stem
-        log_path = LOGS_ROOT / f"{script_name}.log"
-        attempts = max(1, retries)
-
-        for attempt in range(1, attempts + 1):
-            with log_path.open("a", encoding="utf-8") as log_file:
-                log_file.write(f"\n[{datetime.now(timezone.utc).isoformat()}] attempt {attempt}\n")
-                completed = subprocess.run(
-                    ["python", script_path],
-                    cwd=working_dir,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                )
-
-            if completed.returncode == 0:
-                return
-
-        raise RuntimeError(f"Script failed after {attempts} attempts: {script_path}")
-
-    if parallel and len(scripts) > 1:
-        workers = max(1, min(max_parallel, len(scripts)))
-        threads: list[threading.Thread] = []
-        for script_path, working_dir in scripts:
-            thread = threading.Thread(target=run_single_script, args=(script_path, working_dir), daemon=True)
-            thread.start()
-            threads.append(thread)
-
-            while sum(thread_item.is_alive() for thread_item in threads) >= workers:
-                for thread_item in threads:
-                    thread_item.join(timeout=0.1)
-
-        for thread in threads:
-            thread.join()
-        return
-
-    for script_path, working_dir in scripts:
-        run_single_script(script_path, working_dir)
 
 
 def normalize_product(product: str | None) -> str:
@@ -271,37 +219,11 @@ def api_images():
     )
 
 
-def start_background_script(script_name: str):
-    scripts = [
-        (str(APP_ROOT / script_name), str(APP_ROOT)),
-    ]
-    threading.Thread(
-        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=3),
-        daemon=True,
-    ).start()
-    return jsonify(
-        {
-            "ok": True,
-            "message": f"Started {script_name} in background.",
-        }
-    )
-
-
-@app.route("/run-task1")
-def run_task1():
-    scripts = [
-        ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
-        ("/opt/render/project/src/gfs_rain_confidence_ai.py", "/opt/render/project/src"),
-
-        
-        
-    ]
-    threading.Thread(
-        target=lambda: run_scripts(scripts, 2, parallel=True, max_parallel=1),
-        daemon=True,
-    ).start()
-    return "Task started in background! Check logs folder for output.", 200
-
+@app.route("/images/<run_id>/<path:filename>")
+def serve_image(run_id: str, filename: str):
+    run_dir = get_run_directory(run_id, request.args.get("product"))
+    if run_dir is None:
+        abort(404)
 
     image_path = (run_dir / filename).resolve()
     try:
