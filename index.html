@@ -188,10 +188,6 @@
             min-width: 0;
         }
 
-        .product-row {
-            max-width: 220px;
-        }
-
         .run-select,
         .nav-button {
             width: 100%;
@@ -201,12 +197,6 @@
             color: var(--text);
             padding: 8px 10px;
             font-size: 0.84rem;
-        }
-
-        .product-select {
-            padding: 6px 9px;
-            font-size: 0.78rem;
-            max-width: 220px;
         }
 
         .nav-button {
@@ -317,15 +307,6 @@
 
         <section class="controls">
             <div class="control-row">
-                <div class="run-row product-row">
-                    <select id="productSelect" class="run-select product-select" aria-label="Product">
-                        {% for product in products %}
-                        <option value="{{ product.id }}" {% if product.id == selected_product %}selected{% endif %}>{{ product.label }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-            </div>
-            <div class="control-row">
                 <div class="run-row">
                     <select id="runSelect" class="run-select" aria-label="Run" {% if not runs %}disabled{% endif %}>
                         {% for run in runs %}
@@ -333,13 +314,15 @@
                         {% endfor %}
                     </select>
                 </div>
+                <button id="prevButton" class="nav-button" type="button">Previous</button>
+                <button id="nextButton" class="nav-button" type="button">Next</button>
             </div>
             <div class="slider-row">
                 <input id="frameSlider" type="range" min="0" max="{{ image_count - 1 if image_count else 0 }}" value="0" {% if not images %}disabled{% endif %}>
             </div>
             <div class="footer-meta">
                 <div><strong id="positionText">{% if images %}1 / {{ image_count }}{% else %}0 / 0{% endif %}</strong></div>
-                <div id="runStatus">Product: {{ selected_product_label }} | Run: {{ selected_run_label }}</div>
+                <div id="runStatus">Run: {{ selected_run_label }}</div>
                 <div id="frameLabel">{% if images %}{{ images[0].label }}{% else %}Use the slider or arrow keys to change frames.{% endif %}</div>
             </div>
         </section>
@@ -347,15 +330,11 @@
 
     <script id="imagesData" type="application/json">{{ images | tojson }}</script>
     <script id="runsData" type="application/json">{{ runs | tojson }}</script>
-    <script id="productsData" type="application/json">{{ products | tojson }}</script>
     <script id="selectedRunData" type="application/json">{{ selected_run | tojson }}</script>
-    <script id="selectedProductData" type="application/json">{{ selected_product | tojson }}</script>
     <script>
         let images = JSON.parse(document.getElementById("imagesData").textContent);
         let availableRuns = JSON.parse(document.getElementById("runsData").textContent);
-        let availableProducts = JSON.parse(document.getElementById("productsData").textContent);
         let selectedRunId = JSON.parse(document.getElementById("selectedRunData").textContent);
-        let selectedProductId = JSON.parse(document.getElementById("selectedProductData").textContent);
         const slider = document.getElementById("frameSlider");
         const image = document.getElementById("forecastImage");
         const positionText = document.getElementById("positionText");
@@ -367,10 +346,11 @@
         const loadingBarFill = document.getElementById("loadingBarFill");
         const loadingCount = document.getElementById("loadingCount");
         const loadingPercent = document.getElementById("loadingPercent");
-        const productSelect = document.getElementById("productSelect");
         const runSelect = document.getElementById("runSelect");
         const runStatus = document.getElementById("runStatus");
         const frameLabel = document.getElementById("frameLabel");
+        const prevButton = document.getElementById("prevButton");
+        const nextButton = document.getElementById("nextButton");
         const imagePreloadCache = new Map();
         let currentIndex = 0;
         let activeLoadToken = 0;
@@ -386,32 +366,6 @@
 
         function getRunLabel(runId) {
             return availableRuns.find(run => run.id === runId)?.label ?? "No saved runs";
-        }
-
-        function getProductLabel(productId) {
-            return availableProducts.find(product => product.id === productId)?.label ?? "Baseline Ensemble";
-        }
-
-        function syncProductSelect() {
-            if (!productSelect) {
-                return;
-            }
-
-            productSelect.innerHTML = "";
-            for (const product of availableProducts) {
-                const option = document.createElement("option");
-                option.value = product.id;
-                option.textContent = product.label;
-                productSelect.append(option);
-            }
-
-            if (selectedProductId && availableProducts.some(product => product.id === selectedProductId)) {
-                productSelect.value = selectedProductId;
-                return;
-            }
-
-            selectedProductId = availableProducts[0]?.id ?? "baseline";
-            productSelect.value = selectedProductId;
         }
 
         function syncRunSelect() {
@@ -450,8 +404,8 @@
 
         function updateRunStatus() {
             runStatus.textContent = selectedRunId
-                ? `Product: ${getProductLabel(selectedProductId)} | Run: ${getRunLabel(selectedRunId)}`
-                : `Product: ${getProductLabel(selectedProductId)} | No saved runs`;
+                ? `Run: ${getRunLabel(selectedRunId)}`
+                : "No saved runs";
         }
 
         function setLoadingProgress(loadedCount, totalCount) {
@@ -508,6 +462,8 @@
         function syncSlider() {
             slider.max = Math.max(images.length - 1, 0);
             slider.disabled = images.length === 0;
+            prevButton.disabled = images.length <= 1 || currentIndex === 0;
+            nextButton.disabled = images.length <= 1 || currentIndex >= images.length - 1;
         }
 
         function updateFrame(index) {
@@ -645,10 +601,7 @@
             const { showOverlay = false } = options;
 
             try {
-                const response = await fetch(
-                    `/api/images?product=${encodeURIComponent(selectedProductId ?? "baseline")}&run=${encodeURIComponent(runId ?? "")}`,
-                    { cache: "no-store" }
-                );
+                const response = await fetch(`/api/images?run=${encodeURIComponent(runId ?? "")}`, { cache: "no-store" });
                 if (!response.ok) {
                     return;
                 }
@@ -679,20 +632,15 @@
 
         async function refreshRunsAndImages() {
             try {
-                const response = await fetch(
-                    `/api/runs?product=${encodeURIComponent(selectedProductId ?? "baseline")}`,
-                    { cache: "no-store" }
-                );
+                const response = await fetch("/api/runs", { cache: "no-store" });
                 if (!response.ok) {
                     return;
                 }
 
                 const payload = await response.json();
                 availableRuns = payload.runs ?? [];
-                availableProducts = payload.products ?? availableProducts;
                 const latestRunId = getLatestRunId();
                 const selectedRunExists = availableRuns.some(run => run.id === selectedRunId);
-                syncProductSelect();
                 syncRunSelect();
 
                 if (!selectedRunExists && latestRunId) {
@@ -712,7 +660,6 @@
             }
         }
 
-        syncProductSelect();
         syncRunSelect();
         updateRunStatus();
 
@@ -724,17 +671,18 @@
             queueFrameRequest(Number(event.target.value));
         });
 
+        prevButton.addEventListener("click", () => {
+            queueFrameRequest(Math.max(Number(slider.value) - 1, 0));
+        });
+
+        nextButton.addEventListener("click", () => {
+            queueFrameRequest(Math.min(Number(slider.value) + 1, images.length - 1));
+        });
+
         runSelect?.addEventListener("change", event => {
             const requestedRunId = event.target.value;
             followingLatestRun = requestedRunId === getLatestRunId();
             loadRun(requestedRunId, { showOverlay: true });
-        });
-
-        productSelect?.addEventListener("change", event => {
-            selectedProductId = event.target.value;
-            selectedRunId = null;
-            followingLatestRun = true;
-            refreshRunsAndImages();
         });
 
         document.addEventListener("keydown", event => {
