@@ -283,7 +283,7 @@
                     <div class="loading-card">
                         <div class="loading-spinner" aria-hidden="true"></div>
                         <p id="loadingTitle" class="loading-title">Loading forecast frames</p>
-                        <p id="loadingCopy" class="loading-copy">Preparing GFS rain confidence PNGs for the viewer.</p>
+                        <p id="loadingCopy" class="loading-copy">{{ selected_product_empty_message }}</p>
                         <div class="loading-progress">
                             <div class="loading-bar" aria-hidden="true">
                                 <div id="loadingBarFill" class="loading-bar-fill"></div>
@@ -308,6 +308,13 @@
         <section class="controls">
             <div class="control-row">
                 <div class="run-row">
+                    <select id="productSelect" class="run-select" aria-label="Product">
+                        {% for product in products %}
+                        <option value="{{ product.id }}" {% if product.id == selected_product %}selected{% endif %}>{{ product.label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="run-row">
                     <select id="runSelect" class="run-select" aria-label="Run" {% if not runs %}disabled{% endif %}>
                         {% for run in runs %}
                         <option value="{{ run.id }}" {% if run.id == selected_run %}selected{% endif %}>{{ run.label }}</option>
@@ -322,6 +329,7 @@
             </div>
             <div class="footer-meta">
                 <div><strong id="positionText">{% if images %}1 / {{ image_count }}{% else %}0 / 0{% endif %}</strong></div>
+                <div id="productStatus">Product: {{ selected_product_label }}</div>
                 <div id="runStatus">Run: {{ selected_run_label }}</div>
                 <div id="frameLabel">{% if images %}{{ images[0].label }}{% else %}Use the slider or arrow keys to change frames.{% endif %}</div>
             </div>
@@ -330,11 +338,15 @@
 
     <script id="imagesData" type="application/json">{{ images | tojson }}</script>
     <script id="runsData" type="application/json">{{ runs | tojson }}</script>
+    <script id="productsData" type="application/json">{{ products | tojson }}</script>
     <script id="selectedRunData" type="application/json">{{ selected_run | tojson }}</script>
+    <script id="selectedProductData" type="application/json">{{ selected_product | tojson }}</script>
     <script>
         let images = JSON.parse(document.getElementById("imagesData").textContent);
         let availableRuns = JSON.parse(document.getElementById("runsData").textContent);
+        const availableProducts = JSON.parse(document.getElementById("productsData").textContent);
         let selectedRunId = JSON.parse(document.getElementById("selectedRunData").textContent);
+        let selectedProductId = JSON.parse(document.getElementById("selectedProductData").textContent);
         const slider = document.getElementById("frameSlider");
         const image = document.getElementById("forecastImage");
         const positionText = document.getElementById("positionText");
@@ -346,7 +358,9 @@
         const loadingBarFill = document.getElementById("loadingBarFill");
         const loadingCount = document.getElementById("loadingCount");
         const loadingPercent = document.getElementById("loadingPercent");
+        const productSelect = document.getElementById("productSelect");
         const runSelect = document.getElementById("runSelect");
+        const productStatus = document.getElementById("productStatus");
         const runStatus = document.getElementById("runStatus");
         const frameLabel = document.getElementById("frameLabel");
         const prevButton = document.getElementById("prevButton");
@@ -364,8 +378,28 @@
             return availableRuns[0]?.id ?? null;
         }
 
+        function getProductMeta(productId) {
+            return availableProducts.find(product => product.id === productId) ?? availableProducts[0] ?? null;
+        }
+
+        function getProductLabel(productId) {
+            return getProductMeta(productId)?.label ?? "Rain Confidence";
+        }
+
+        function getProductEmptyMessage(productId) {
+            return getProductMeta(productId)?.empty_message ?? "Preparing forecast PNGs for the viewer.";
+        }
+
         function getRunLabel(runId) {
             return availableRuns.find(run => run.id === runId)?.label ?? "No saved runs";
+        }
+
+        function syncProductSelect() {
+            if (!productSelect) {
+                return;
+            }
+
+            productSelect.value = selectedProductId;
         }
 
         function syncRunSelect() {
@@ -403,6 +437,7 @@
         }
 
         function updateRunStatus() {
+            productStatus.textContent = `Product: ${getProductLabel(selectedProductId)}`;
             runStatus.textContent = selectedRunId
                 ? `Run: ${getRunLabel(selectedRunId)}`
                 : "No saved runs";
@@ -601,7 +636,10 @@
             const { showOverlay = false } = options;
 
             try {
-                const response = await fetch(`/api/images?run=${encodeURIComponent(runId ?? "")}`, { cache: "no-store" });
+                const response = await fetch(
+                    `/api/images?run=${encodeURIComponent(runId ?? "")}&product=${encodeURIComponent(selectedProductId ?? "")}`,
+                    { cache: "no-store" }
+                );
                 if (!response.ok) {
                     return;
                 }
@@ -632,7 +670,10 @@
 
         async function refreshRunsAndImages() {
             try {
-                const response = await fetch("/api/runs", { cache: "no-store" });
+                const response = await fetch(
+                    `/api/runs?product=${encodeURIComponent(selectedProductId ?? "")}`,
+                    { cache: "no-store" }
+                );
                 if (!response.ok) {
                     return;
                 }
@@ -661,6 +702,7 @@
         }
 
         syncRunSelect();
+        syncProductSelect();
         updateRunStatus();
 
         slider.addEventListener("input", event => {
@@ -685,6 +727,32 @@
             loadRun(requestedRunId, { showOverlay: true });
         });
 
+        productSelect?.addEventListener("change", async event => {
+            selectedProductId = event.target.value;
+            followingLatestRun = true;
+            showLoading("Loading forecast frames", getProductEmptyMessage(selectedProductId), 0, 0);
+            try {
+                const response = await fetch(
+                    `/api/runs?product=${encodeURIComponent(selectedProductId ?? "")}`,
+                    { cache: "no-store" }
+                );
+                if (!response.ok) {
+                    hideLoading();
+                    return;
+                }
+
+                const payload = await response.json();
+                availableRuns = payload.runs ?? [];
+                selectedRunId = payload.selected_run ?? getLatestRunId();
+                syncProductSelect();
+                syncRunSelect();
+                updateRunStatus();
+                await loadRun(selectedRunId, { showOverlay: true });
+            } catch {
+                hideLoading();
+            }
+        });
+
         document.addEventListener("keydown", event => {
             if (event.key === "ArrowLeft") {
                 queueFrameRequest(Math.max(Number(slider.value) - 1, 0));
@@ -699,7 +767,7 @@
             preloadImageSet(
                 images,
                 "Loading forecast frames",
-                "Showing the first frame, then loading the remaining PNGs in the background.",
+                `Showing the first ${getProductLabel(selectedProductId).toLowerCase()} frame, then loading the remaining PNGs in the background.`,
                 { waitForFullSet: false }
             ).then(preloadedImages => {
                 if (!preloadedImages) {
@@ -713,7 +781,7 @@
         } else {
             syncSlider();
             renderImageState(false);
-            showLoading("Waiting for forecast frames", "The viewer will open automatically when PNGs are available.", 0, 0);
+            showLoading("Waiting for forecast frames", getProductEmptyMessage(selectedProductId), 0, 0);
         }
 
         window.setInterval(refreshRunsAndImages, 5000);
