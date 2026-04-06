@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
+from gfs_rain_confidence import BASE_DIR
+
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent))
 APP_ROOT = Path(__file__).resolve().parent
@@ -21,11 +23,7 @@ def default_data_root() -> Path:
     if configured_root:
         return Path(configured_root).expanduser().resolve()
 
-    linux_data_root = Path("/var/data")
-    if os.name != "nt" and linux_data_root.is_dir():
-        return (linux_data_root / "gfs_rain_confidence_output").resolve()
-
-    return (APP_ROOT / "gfs_rain_confidence_output").resolve()
+    return (BASE_DIR / "gfs_rain_confidence_output").resolve()
 
 
 DATA_ROOT = default_data_root()
