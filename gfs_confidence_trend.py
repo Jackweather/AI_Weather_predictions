@@ -46,7 +46,7 @@ TREND_COLORS = [
     "#ef5350",
     "#ffcdd2",
     "#ffffff",
-    "#d8f3dc",
+    "#a8f3b3",
     "#74c69d",
     "#2d6a4f",
     "#0b5d1e",
