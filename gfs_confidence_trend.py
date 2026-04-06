@@ -23,11 +23,11 @@ from gfs_rain_confidence import (
     DOWNLOAD_FORECAST_HOURS,
     EASTERN,
     MAX_DOWNLOAD_FORECAST_HOUR,
+    RunCycle,
     UTC,
     NomadsClient,
     build_plot_forecast_hours,
     build_run_sequence,
-    calculate_confidence,
     collect_aligned_members,
     download_run,
     ensure_complete_history,
@@ -45,10 +45,11 @@ TREND_COLORS = [
     "#c62828",
     "#ef5350",
     "#ffcdd2",
-    "#f3f4f6",
+    "#ffffff",
     "#d8f3dc",
     "#74c69d",
     "#2d6a4f",
+    "#0b5d1e",
 ]
 
 
@@ -174,33 +175,55 @@ def build_plot_title(run_cycle, forecast_hour: int) -> str:
     hour_string = valid_local.strftime("%I:%M %p").lstrip("0")
     day_of_week = valid_local.strftime("%A")
     return (
-        f"Run-to-Run Confidence Trend F{forecast_hour:03d}\n"
+        f"Multi-Run Confidence Trend F{forecast_hour:03d}\n"
         f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_string} ET"
     )
 
 
-def build_plot_subtitle(run_cycle, previous_run_cycle, forecast_hour: int, member_count: int) -> str:
-    previous_forecast_hour = forecast_hour + 6
+def build_plot_subtitle(run_cycle: RunCycle, forecast_hour: int, member_count: int) -> str:
     return (
-        f"Current {run_cycle.tag} F{forecast_hour:03d} vs Previous {previous_run_cycle.tag} "
-        f"F{previous_forecast_hour:03d} | Aligned Members {member_count}"
+        f"Weighted comparison across {member_count} aligned runs | Latest run {run_cycle.tag} "
+        f"has the strongest influence | F{forecast_hour:03d}"
     )
 
 
 def trend_cmap() -> tuple[ListedColormap, BoundaryNorm]:
-    boundaries = np.array([-100, -75, -50, -25, 0, 25, 50, 75, 100], dtype=np.float32)
+    boundaries = np.array([-100, -75, -50, -25, -1, 1, 25, 50, 75, 100], dtype=np.float32)
     cmap = ListedColormap(TREND_COLORS, name="confidence_trend")
     norm = BoundaryNorm(boundaries, cmap.N, clip=True)
     return cmap, norm
 
 
-def calculate_confidence_change_percent(
-    current_confidence: np.ndarray,
-    previous_confidence: np.ndarray,
+def calculate_weighted_trend_percent(
+    members_mmhr: np.ndarray,
+    rain_threshold_mmhr: float,
 ) -> np.ndarray:
-    delta_points = current_confidence - previous_confidence
-    delta_percent = np.clip((delta_points / 10.0) * 100.0, -100.0, 100.0)
-    return delta_percent.astype(np.float32)
+    member_count = members_mmhr.shape[0]
+    if member_count < 2:
+        return np.zeros(members_mmhr.shape[1:], dtype=np.float32)
+
+    wet_signal = (members_mmhr >= rain_threshold_mmhr).astype(np.float32)
+    weights = np.linspace(member_count, 1, member_count, dtype=np.float32)
+
+    trend_numerator = np.zeros(members_mmhr.shape[1:], dtype=np.float32)
+    trend_denominator = np.zeros(members_mmhr.shape[1:], dtype=np.float32)
+
+    for newer_index in range(member_count - 1):
+        newer_signal = wet_signal[newer_index]
+        for older_index in range(newer_index + 1, member_count):
+            pair_weight = weights[newer_index] * weights[older_index]
+            pair_delta = newer_signal - wet_signal[older_index]
+            trend_numerator += pair_delta * pair_weight
+            trend_denominator += pair_weight
+
+    trend_ratio = np.divide(
+        trend_numerator,
+        np.maximum(trend_denominator, 1e-6),
+        out=np.zeros_like(trend_numerator),
+        where=trend_denominator > 0,
+    )
+    trend_percent = np.clip(trend_ratio * 100.0, -100.0, 100.0)
+    return trend_percent.astype(np.float32)
 
 
 def collect_comparison_fields(
@@ -209,54 +232,32 @@ def collect_comparison_fields(
     forecast_hour: int,
     history_runs: int,
     rain_threshold_mmhr: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     current_sequence = build_run_sequence(run_cycle, history_runs)
-    previous_run_cycle = run_cycle.shifted(hours=-6)
-    previous_sequence = build_run_sequence(previous_run_cycle, history_runs)
-    previous_forecast_hour = forecast_hour + 6
 
     current_members, lats, lons, current_metadata = collect_aligned_members(
         root,
         current_sequence,
         forecast_hour,
     )
-    previous_members, previous_lats, previous_lons, previous_metadata = collect_aligned_members(
-        root,
-        previous_sequence,
-        previous_forecast_hour,
-    )
-
-    if current_members.shape[1:] != previous_members.shape[1:]:
-        raise RuntimeError(
-            f"Mismatched confidence grid shapes for {run_cycle.tag} f{forecast_hour:03d}: "
-            f"{current_members.shape[1:]} vs {previous_members.shape[1:]}."
-        )
-
-    if lats.shape != previous_lats.shape or lons.shape != previous_lons.shape:
-        raise RuntimeError(
-            f"Mismatched latitude/longitude grids for {run_cycle.tag} f{forecast_hour:03d}."
-        )
-
-    current_confidence, current_mean_rate, _, _ = calculate_confidence(current_members, rain_threshold_mmhr)
-    previous_confidence, previous_mean_rate, _, _ = calculate_confidence(previous_members, rain_threshold_mmhr)
-    member_count = min(len(current_metadata), len(previous_metadata))
-    return lats, lons, current_confidence, previous_confidence, np.maximum(current_mean_rate, previous_mean_rate), member_count
+    mask_rate = np.max(current_members, axis=0)
+    member_count = len(current_metadata)
+    return lats, lons, current_members, mask_rate, member_count
 
 
 def plot_trend_map(
     save_path: Path,
     run_cycle,
-    previous_run_cycle,
     forecast_hour: int,
     lats: np.ndarray,
     lons: np.ndarray,
-    confidence_change_percent: np.ndarray,
+    trend_percent: np.ndarray,
     mask_rate: np.ndarray,
     member_count: int,
     rain_threshold_mmhr: float,
     smooth_passes: int,
 ) -> None:
-    smoothed_change = np.clip(smooth_field(confidence_change_percent, smooth_passes), -100.0, 100.0)
+    smoothed_change = np.clip(smooth_field(trend_percent, smooth_passes), -100.0, 100.0)
     smoothed_mask_rate = np.maximum(smooth_field(mask_rate, smooth_passes), 0.0)
     projected_change = np.ma.masked_where(smoothed_mask_rate < rain_threshold_mmhr, smoothed_change)
     cmap, norm = trend_cmap()
@@ -272,7 +273,7 @@ def plot_trend_map(
         lons,
         lats,
         projected_change,
-        levels=np.array([-100, -75, -50, -25, 0, 25, 50, 75, 100], dtype=np.float32),
+        levels=np.array([-100, -75, -50, -25, -1, 1, 25, 50, 75, 100], dtype=np.float32),
         cmap=cmap,
         norm=norm,
         extend="both",
@@ -290,7 +291,7 @@ def plot_trend_map(
     axis.text(
         0.01,
         0.01,
-        build_plot_subtitle(run_cycle, previous_run_cycle, forecast_hour, member_count),
+        build_plot_subtitle(run_cycle, forecast_hour, member_count),
         transform=axis.transAxes,
         fontsize=10,
         color="#304253",
@@ -300,7 +301,7 @@ def plot_trend_map(
     )
 
     colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02)
-    colorbar.set_label("Confidence change vs prior run (% of 0-10 scale)")
+    colorbar.set_label("Weighted run-to-run trend (%)")
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(save_path, dpi=160, bbox_inches="tight")
@@ -316,28 +317,26 @@ def build_trend_products(
     smooth_passes: int,
 ) -> None:
     plot_root = root / "plots" / run_cycle.tag
-    previous_run_cycle = run_cycle.shifted(hours=-6)
     for forecast_hour in plot_forecast_hours:
-        lats, lons, current_confidence, previous_confidence, mask_rate, member_count = collect_comparison_fields(
+        lats, lons, members_mmhr, mask_rate, member_count = collect_comparison_fields(
             root=root,
             run_cycle=run_cycle,
             forecast_hour=forecast_hour,
             history_runs=history_runs,
             rain_threshold_mmhr=rain_threshold_mmhr,
         )
-        confidence_change_percent = calculate_confidence_change_percent(
-            current_confidence,
-            previous_confidence,
+        trend_percent = calculate_weighted_trend_percent(
+            members_mmhr,
+            rain_threshold_mmhr,
         )
         save_path = plot_root / f"rain_confidence_trend_f{forecast_hour:03d}.png"
         plot_trend_map(
             save_path=save_path,
             run_cycle=run_cycle,
-            previous_run_cycle=previous_run_cycle,
             forecast_hour=forecast_hour,
             lats=lats,
             lons=lons,
-            confidence_change_percent=confidence_change_percent,
+            trend_percent=trend_percent,
             mask_rate=mask_rate,
             member_count=member_count,
             rain_threshold_mmhr=rain_threshold_mmhr,
@@ -360,7 +359,7 @@ def main() -> None:
     )
 
     current_run = resolve_latest_complete_cycle(now_utc, args.cycle_lookback, client)
-    required_run_cycles = build_run_sequence(current_run, args.history_runs + 1)
+    required_run_cycles = build_run_sequence(current_run, args.history_runs)
     ensure_complete_history(required_run_cycles, client)
 
     if not args.skip_download:
