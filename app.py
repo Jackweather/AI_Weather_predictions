@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,18 @@ LOGS_ROOT = APP_ROOT / "logs"
 PNG_PATTERN = re.compile(r"f(\d{3})", re.IGNORECASE)
 RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{2}z$", re.IGNORECASE)
 EASTERN_TZ = ZoneInfo("America/New_York")
+PRODUCTS = {
+    "confidence": {
+        "label": "Rain Confidence",
+        "filename_prefix": "rain_confidence_f",
+        "empty_message": "Preparing GFS rain confidence PNGs for the viewer.",
+    },
+    "trend": {
+        "label": "Run-to-Run Trend",
+        "filename_prefix": "rain_confidence_trend_f",
+        "empty_message": "Preparing run-to-run confidence trend PNGs for the viewer.",
+    },
+}
 
 
 def run_scripts(
@@ -52,7 +65,7 @@ def run_scripts(
             with log_path.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"\n[{datetime.now(timezone.utc).isoformat()}] attempt {attempt}\n")
                 completed = subprocess.run(
-                    ["python", script_path],
+                    [sys.executable, script_path],
                     cwd=working_dir,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -95,6 +108,17 @@ def parse_run_id(run_id: str) -> datetime | None:
         return None
 
 
+def resolve_product(product_key: str | None) -> str:
+    if product_key in PRODUCTS:
+        return str(product_key)
+    return "confidence"
+
+
+def get_product_files(run_dir: Path, product_key: str):
+    product = PRODUCTS[product_key]
+    return run_dir.glob(f"{product['filename_prefix']}*.png")
+
+
 def format_run_label(run_id: str) -> str:
     run_time_utc = parse_run_id(run_id)
     if run_time_utc is None:
@@ -116,7 +140,7 @@ def get_run_directory(run_id: str | None) -> Path | None:
     return run_dir
 
 
-def list_runs() -> list[dict[str, str | int | bool]]:
+def list_runs(product_key: str = "confidence") -> list[dict[str, str | int | bool]]:
     run_items: list[dict[str, str | int | bool]] = []
     if not PLOTS_ROOT.is_dir():
         return run_items
@@ -125,7 +149,7 @@ def list_runs() -> list[dict[str, str | int | bool]]:
         if not run_dir.is_dir() or parse_run_id(run_dir.name) is None:
             continue
 
-        image_count = sum(1 for _ in run_dir.glob("*.png"))
+        image_count = sum(1 for _ in get_product_files(run_dir, product_key))
         if image_count == 0:
             continue
 
@@ -143,8 +167,11 @@ def list_runs() -> list[dict[str, str | int | bool]]:
     return run_items
 
 
-def resolve_run_id(requested_run_id: str | None = None) -> str | None:
-    run_items = list_runs()
+def resolve_run_id(
+    requested_run_id: str | None = None,
+    product_key: str = "confidence",
+) -> str | None:
+    run_items = list_runs(product_key)
     valid_run_ids = {str(item["id"]) for item in run_items}
 
     if requested_run_id in valid_run_ids:
@@ -156,25 +183,28 @@ def resolve_run_id(requested_run_id: str | None = None) -> str | None:
     return None
 
 
-def get_run_label(run_id: str | None) -> str:
+def get_run_label(run_id: str | None, product_key: str = "confidence") -> str:
     if not run_id:
         return "No saved runs"
 
-    for run in list_runs():
+    for run in list_runs(product_key):
         if str(run["id"]) == run_id:
             return str(run["label"])
 
     return run_id
 
 
-def list_images(run_id: str | None = None) -> tuple[list[dict[str, str | int]], str | None]:
-    resolved_run_id = resolve_run_id(run_id)
+def list_images(
+    run_id: str | None = None,
+    product_key: str = "confidence",
+) -> tuple[list[dict[str, str | int]], str | None]:
+    resolved_run_id = resolve_run_id(run_id, product_key)
     image_dir = get_run_directory(resolved_run_id) if resolved_run_id else None
     if image_dir is None:
         return [], resolved_run_id
 
     image_items: list[dict[str, str | int]] = []
-    for image_path in sorted(image_dir.glob("*.png"), key=lambda path: path.name):
+    for image_path in sorted(get_product_files(image_dir, product_key), key=lambda path: path.name):
         match = PNG_PATTERN.search(image_path.stem)
         frame = int(match.group(1)) if match else -1
         stat = image_path.stat()
@@ -193,15 +223,20 @@ def list_images(run_id: str | None = None) -> tuple[list[dict[str, str | int]], 
 
 @app.route("/")
 def index() -> str:
-    runs = list_runs()
+    selected_product = resolve_product(request.args.get("product"))
+    runs = list_runs(selected_product)
     requested_run_id = request.args.get("run")
-    images, selected_run = list_images(requested_run_id)
+    images, selected_run = list_images(requested_run_id, selected_product)
     return render_template(
         "index.html",
         images=images,
         runs=runs,
+        products=[{"id": product_id, **product} for product_id, product in PRODUCTS.items()],
+        selected_product=selected_product,
+        selected_product_label=PRODUCTS[selected_product]["label"],
+        selected_product_empty_message=PRODUCTS[selected_product]["empty_message"],
         selected_run=selected_run,
-        selected_run_label=get_run_label(selected_run),
+        selected_run_label=get_run_label(selected_run, selected_product),
         image_count=len(images),
         plots_root=str(PLOTS_ROOT),
     )
@@ -210,25 +245,34 @@ def index() -> str:
 
 @app.route("/api/runs")
 def api_runs():
-    runs = list_runs()
-    return jsonify({"runs": runs, "selected_run": resolve_run_id(request.args.get("run"))})
+    selected_product = resolve_product(request.args.get("product"))
+    runs = list_runs(selected_product)
+    return jsonify(
+        {
+            "runs": runs,
+            "selected_run": resolve_run_id(request.args.get("run"), selected_product),
+            "selected_product": selected_product,
+        }
+    )
 
 
 @app.route("/api/images")
 def api_images():
-    images, resolved_run_id = list_images(request.args.get("run"))
-    return jsonify({"images": images, "run_id": resolved_run_id})
+    selected_product = resolve_product(request.args.get("product"))
+    images, resolved_run_id = list_images(request.args.get("run"), selected_product)
+    return jsonify({"images": images, "run_id": resolved_run_id, "product": selected_product})
 
 
 @app.route("/run-task1")
 def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_rain_confidence_trend.py", "/opt/render/project/src"),
         
         
     ]
     threading.Thread(
-        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=3),
+        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=1),
         daemon=True,
     ).start()
     return "Task started in background! Check logs folder for output.", 200
