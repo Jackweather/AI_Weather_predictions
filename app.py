@@ -43,6 +43,11 @@ PRODUCTS = {
         "filename_prefix": "lightning_confidence_f",
         "empty_message": "Preparing GFS lightning confidence PNGs for the viewer.",
     },
+    "wind": {
+        "label": "Wind Gust Confidence",
+        "filename_prefix": "wind_confidence_f",
+        "empty_message": "Preparing GFS wind gust confidence PNGs for the viewer.",
+    },
     "temperature": {
         "label": "Average Temperature",
         "filename_prefix": "temperature_average_f",
@@ -281,6 +286,7 @@ def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_lightning_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_wind_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_temperature_average.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_tornado_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_confidence_trend.py", "/opt/render/project/src"),
