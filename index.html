@@ -178,7 +178,7 @@
 
         .control-row {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) auto auto;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 8px;
             align-items: center;
             margin-top: 2px;
@@ -188,8 +188,7 @@
             min-width: 0;
         }
 
-        .run-select,
-        .nav-button {
+        .run-select {
             width: 100%;
             border: 1px solid var(--border);
             border-radius: 10px;
@@ -199,18 +198,12 @@
             font-size: 0.84rem;
         }
 
-        .nav-button {
-            width: auto;
-            cursor: pointer;
-        }
-
         .run-select option {
             background: #0b1628;
             color: var(--text);
         }
 
-        .run-select:focus,
-        .nav-button:focus {
+        .run-select:focus {
             outline: 2px solid rgba(102, 217, 239, 0.45);
             outline-offset: 2px;
         }
@@ -321,8 +314,6 @@
                         {% endfor %}
                     </select>
                 </div>
-                <button id="prevButton" class="nav-button" type="button">Previous</button>
-                <button id="nextButton" class="nav-button" type="button">Next</button>
             </div>
             <div class="slider-row">
                 <input id="frameSlider" type="range" min="0" max="{{ image_count - 1 if image_count else 0 }}" value="0" {% if not images %}disabled{% endif %}>
@@ -363,8 +354,6 @@
         const productStatus = document.getElementById("productStatus");
         const runStatus = document.getElementById("runStatus");
         const frameLabel = document.getElementById("frameLabel");
-        const prevButton = document.getElementById("prevButton");
-        const nextButton = document.getElementById("nextButton");
         const imagePreloadCache = new Map();
         let currentIndex = 0;
         let activeLoadToken = 0;
@@ -497,8 +486,6 @@
         function syncSlider() {
             slider.max = Math.max(images.length - 1, 0);
             slider.disabled = images.length === 0;
-            prevButton.disabled = images.length <= 1 || currentIndex === 0;
-            nextButton.disabled = images.length <= 1 || currentIndex >= images.length - 1;
         }
 
         function updateFrame(index) {
@@ -711,14 +698,6 @@
 
         slider.addEventListener("change", event => {
             queueFrameRequest(Number(event.target.value));
-        });
-
-        prevButton.addEventListener("click", () => {
-            queueFrameRequest(Math.max(Number(slider.value) - 1, 0));
-        });
-
-        nextButton.addEventListener("click", () => {
-            queueFrameRequest(Math.min(Number(slider.value) + 1, images.length - 1));
         });
 
         runSelect?.addEventListener("change", event => {
