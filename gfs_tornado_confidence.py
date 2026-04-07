@@ -410,10 +410,10 @@ def calculate_member_tornado_score(fields: dict[str, np.ndarray]) -> np.ndarray:
     helicity = np.maximum(fields["hlcy"], 0.0)
     reflectivity = np.maximum(fields["refc"], 0.0)
 
-    cape_score = np.clip(cape / 2500.0, 0.0, 1.0)
-    cin_support = np.clip(1.0 - (np.abs(cin) / 200.0), 0.0, 1.0)
-    helicity_score = np.clip(helicity / 315.0, 0.0, 1.0)
-    reflectivity_score = np.clip((reflectivity - 10.0) / 35.0, 0.0, 1.0)
+    cape_score = np.clip(cape / 1800.0, 0.0, 1.0)
+    cin_support = np.clip(1.0 - (np.abs(cin) / 275.0), 0.0, 1.0)
+    helicity_score = np.clip(helicity / 240.0, 0.0, 1.0)
+    reflectivity_score = np.clip((reflectivity - 5.0) / 40.0, 0.0, 1.0)
 
     severe_overlap = np.minimum(helicity_score, np.maximum(cape_score, reflectivity_score))
     raw_score = (
@@ -425,7 +425,7 @@ def calculate_member_tornado_score(fields: dict[str, np.ndarray]) -> np.ndarray:
     raw_score *= 0.65 + 0.35 * severe_overlap
 
     suppress_nonconvective = np.where(
-        (cape < 250.0) | (reflectivity < 10.0),
+        (cape < 100.0) | (reflectivity < 5.0),
         0.0,
         1.0,
     )
@@ -474,13 +474,13 @@ def collect_aligned_members(
 
 def calculate_tornado_confidence(member_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mean_score = member_scores.mean(axis=0)
-    active_members = member_scores >= 4.5
+    active_members = member_scores >= 3.0
     agreement = active_members.mean(axis=0)
     spread = member_scores.std(axis=0)
     spread_penalty = np.clip(spread / 4.0, 0.0, 1.0)
 
     confidence = mean_score * (0.40 + 0.60 * agreement) * (1.0 - 0.35 * spread_penalty)
-    confidence = np.where(mean_score >= 1.2, confidence, 0.0)
+    confidence = np.where(mean_score >= 0.6, confidence, 0.0)
     confidence = np.clip(confidence, 0.0, 10.0)
 
     return confidence.astype(np.float32), mean_score.astype(np.float32), agreement.astype(np.float32)
@@ -515,7 +515,7 @@ def plot_tornado_map(
 ) -> None:
     smoothed_confidence = np.clip(smooth_field(confidence, smooth_passes), 0.0, 10.0)
     smoothed_mean_score = np.maximum(smooth_field(mean_score, smooth_passes), 0.0)
-    projected_confidence = np.ma.masked_where(smoothed_mean_score < 1.2, smoothed_confidence)
+    projected_confidence = np.ma.masked_where(smoothed_mean_score < 0.6, smoothed_confidence)
     cmap, norm = tornado_cmap()
 
     figure = plt.figure(figsize=(15, 9))
