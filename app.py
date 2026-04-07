@@ -38,6 +38,11 @@ PRODUCTS = {
         "filename_prefix": "rain_confidence_f",
         "empty_message": "Preparing GFS rain confidence PNGs for the viewer.",
     },
+    "lightning": {
+        "label": "Lightning Confidence",
+        "filename_prefix": "lightning_confidence_f",
+        "empty_message": "Preparing GFS lightning confidence PNGs for the viewer.",
+    },
     "trend": {
         "label": "Run-to-Run Trend",
         "filename_prefix": "rain_confidence_trend_f",
@@ -265,9 +270,8 @@ def api_images():
 def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
-        ("/opt/render/project/src/gfs_rain_confidence_trend.py", "/opt/render/project/src"),
-        
-        
+        ("/opt/render/project/src/gfs_lightning_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_confidence_trend.py", "/opt/render/project/src"),
     ]
     threading.Thread(
         target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=1),
