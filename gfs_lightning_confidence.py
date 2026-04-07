@@ -82,16 +82,23 @@ FIELD_SPECS = {
     },
     "dzdt": {
         "backend_kwargs": (
+            {"filter_by_keys": {"shortName": "wz", "typeOfLevel": "isobaricInhPa", "level": 800}, "indexpath": ""},
+            {"filter_by_keys": {"shortName": "wz", "typeOfLevel": "isobaricInPa", "level": 80000}, "indexpath": ""},
+            {"filter_by_keys": {"shortName": "wz", "level": 800}, "indexpath": ""},
+            {"filter_by_keys": {"shortName": "wz"}, "indexpath": ""},
             {"filter_by_keys": {"shortName": "dzdt", "typeOfLevel": "isobaricInhPa", "level": 800}, "indexpath": ""},
             {"filter_by_keys": {"shortName": "dzdt", "typeOfLevel": "isobaricInPa", "level": 80000}, "indexpath": ""},
             {"filter_by_keys": {"shortName": "dzdt", "level": 800}, "indexpath": ""},
             {"filter_by_keys": {"shortName": "dzdt"}, "indexpath": ""},
         ),
         "selectors": (
+            ("wz",),
             ("dzdt",),
+            ("GRIB_shortName", "wz"),
             ("DZDT",),
             ("GRIB_shortName", "dzdt"),
             ("GRIB_name", "Vertical velocity (geometric)"),
+            ("GRIB_name", "Geometric vertical velocity"),
         ),
     },
     "refc": {
