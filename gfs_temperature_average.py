@@ -394,17 +394,7 @@ def plot_temperature_map(save_path: Path, run_cycle: RunCycle, forecast_hour: in
         loc="left",
         fontweight="normal",
     )
-    axis.text(
-        0.0,
-        1.01,
-        f"Aligned runs averaged: {member_count}",
-        transform=axis.transAxes,
-        fontsize=10,
-        color="#55657d",
-        ha="left",
-        va="bottom",
-    )
-
+    
     colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02)
     colorbar.set_label("Average 2 m temperature (F)")
     colorbar.set_ticks(boundaries)
