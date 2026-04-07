@@ -40,7 +40,7 @@ from gfs_rain_confidence import (
 matplotlib.use("Agg")
 
 TORNADO_COLORS = [
-    "#5e4fa2",
+    "#ffffff",
     "#3b74b9",
     "#2c9bd6",
     "#37c5c9",
@@ -410,10 +410,10 @@ def calculate_member_tornado_score(fields: dict[str, np.ndarray]) -> np.ndarray:
     helicity = np.maximum(fields["hlcy"], 0.0)
     reflectivity = np.maximum(fields["refc"], 0.0)
 
-    cape_score = np.clip(cape / 3500.0, 0.0, 1.0)
-    cin_support = np.clip(1.0 - (np.abs(cin) / 250.0), 0.0, 1.0)
-    helicity_score = np.clip(helicity / 350.0, 0.0, 1.0)
-    reflectivity_score = np.clip((reflectivity - 18.0) / 37.0, 0.0, 1.0)
+    cape_score = np.clip(cape / 2500.0, 0.0, 1.0)
+    cin_support = np.clip(1.0 - (np.abs(cin) / 200.0), 0.0, 1.0)
+    helicity_score = np.clip(helicity / 315.0, 0.0, 1.0)
+    reflectivity_score = np.clip((reflectivity - 10.0) / 35.0, 0.0, 1.0)
 
     severe_overlap = np.minimum(helicity_score, np.maximum(cape_score, reflectivity_score))
     raw_score = (
