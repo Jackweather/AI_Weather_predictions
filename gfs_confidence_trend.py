@@ -1,391 +1,299 @@
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-import logging
+import os
+import re
+import subprocess
+import sys
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import matplotlib
-import numpy as np
-from matplotlib import pyplot as plt
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
-from gfs_rain_confidence import (
-    BASE_DIR,
-    CONUS_EXTENT,
-    DEFAULT_DOWNLOAD_WORKERS,
-    DEFAULT_MAX_PLOT_FORECAST_HOUR,
-    DEFAULT_MAX_REQUEST_RETRIES,
-    DEFAULT_REQUEST_MIN_INTERVAL,
-    DEFAULT_SMOOTH_PASSES,
-    DOWNLOAD_FORECAST_HOURS,
-    EASTERN,
-    MAX_DOWNLOAD_FORECAST_HOUR,
-    RunCycle,
-    UTC,
-    NomadsClient,
-    build_plot_forecast_hours,
-    build_run_sequence,
-    collect_aligned_members,
-    download_run,
-    ensure_complete_history,
-    prune_old_run_directories,
-    resolve_latest_complete_cycle,
-    setup_logging,
-    smooth_field,
-    valid_time,
-)
-
-matplotlib.use("Agg")
-
-TREND_COLORS = [
-    "#7f0000",
-    "#c62828",
-    "#ef5350",
-    "#ffcdd2",
-    "#ffffff",
-    "#a8f3b3",
-    "#74c69d",
-    "#2d6a4f",
-    "#0b5d1e",
-]
+from gfs_rain_confidence import BASE_DIR
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Build GFS run-to-run rain confidence trend maps that show where confidence "
-            "increased or decreased versus the prior run for the same valid time."
-        )
-    )
-    parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=BASE_DIR / "gfs_rain_confidence_output",
-        help="Directory containing downloaded GRIB files and generated plots.",
-    )
-    parser.add_argument(
-        "--history-runs",
-        type=int,
-        default=7,
-        help="How many previous 6-hour runs are used when calculating each confidence field.",
-    )
-    parser.add_argument(
-        "--retain-runs",
-        type=int,
-        default=8,
-        help="How many cycle folders to keep in the trend plot archive.",
-    )
-    parser.add_argument(
-        "--cycle-lookback",
-        type=int,
-        default=8,
-        help="How many candidate cycles to search when looking for the latest complete run.",
-    )
-    parser.add_argument(
-        "--download-workers",
-        type=int,
-        default=DEFAULT_DOWNLOAD_WORKERS,
-        help="Concurrent downloads per run when the trend script needs missing GRIB files.",
-    )
-    parser.add_argument(
-        "--request-min-interval",
-        type=float,
-        default=DEFAULT_REQUEST_MIN_INTERVAL,
-        help="Minimum seconds between NOMADS requests while probing for complete runs.",
-    )
-    parser.add_argument(
-        "--max-request-retries",
-        type=int,
-        default=DEFAULT_MAX_REQUEST_RETRIES,
-        help="How many times to retry NOMADS requests after transient errors.",
-    )
-    parser.add_argument(
-        "--rain-threshold-mmhr",
-        type=float,
-        default=0.10,
-        help="Rain threshold in mm/hr used to suppress trend shading where both runs are dry.",
-    )
-    parser.add_argument(
-        "--smooth-passes",
-        type=int,
-        default=DEFAULT_SMOOTH_PASSES,
-        help="How many passes of spatial smoothing to apply before plotting.",
-    )
-    parser.add_argument(
-        "--max-plot-forecast-hour",
-        type=int,
-        default=DEFAULT_MAX_PLOT_FORECAST_HOUR,
-        help="Highest forecast hour to render to PNGs. Must be a multiple of 6.",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=int,
-        default=180,
-        help="Seconds allowed for each NOMADS request.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Redownload files even if they already exist locally.",
-    )
-    parser.add_argument(
-        "--skip-download",
-        action="store_true",
-        help="Assume the required GRIB files already exist locally and only build plots.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity.",
-    )
-    return parser.parse_args()
+app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent))
+APP_ROOT = Path(__file__).resolve().parent
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.history_runs < 1:
-        raise ValueError("--history-runs must be at least 1 for run-to-run trend plots.")
-    if args.retain_runs < 1:
-        raise ValueError("--retain-runs must be at least 1.")
-    if args.retain_runs < args.history_runs + 1:
-        raise ValueError("--retain-runs must be at least --history-runs + 1.")
-    if args.download_workers < 1:
-        raise ValueError("--download-workers must be at least 1.")
-    if args.request_min_interval < 0:
-        raise ValueError("--request-min-interval must be zero or greater.")
-    if args.max_request_retries < 1:
-        raise ValueError("--max-request-retries must be at least 1.")
-    if args.max_plot_forecast_hour < 6:
-        raise ValueError("--max-plot-forecast-hour must be at least 6.")
-    if args.max_plot_forecast_hour > MAX_DOWNLOAD_FORECAST_HOUR - 6:
-        raise ValueError(
-            f"--max-plot-forecast-hour cannot exceed {MAX_DOWNLOAD_FORECAST_HOUR - 6} for trend plots."
-        )
-    if args.max_plot_forecast_hour % 6 != 0:
-        raise ValueError("--max-plot-forecast-hour must be a multiple of 6.")
-    if args.smooth_passes < 0:
-        raise ValueError("--smooth-passes must be zero or greater.")
+def default_data_root() -> Path:
+    configured_root = os.environ.get("GFS_RAIN_CONFIDENCE_ROOT")
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+
+    return (BASE_DIR / "gfs_rain_confidence_output").resolve()
 
 
-def build_plot_title(run_cycle, forecast_hour: int) -> str:
-    valid_local = valid_time(run_cycle, forecast_hour).astimezone(EASTERN)
-    hour_string = valid_local.strftime("%I:%M %p").lstrip("0")
-    day_of_week = valid_local.strftime("%A")
-    return (
-        f"Multi-Run Confidence Trend F{forecast_hour:03d}\n"
-        f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_string} ET"
-    )
+DATA_ROOT = default_data_root()
+PLOTS_ROOT = DATA_ROOT / "plots"
+LOGS_ROOT = APP_ROOT / "logs"
+PNG_PATTERN = re.compile(r"f(\d{3})", re.IGNORECASE)
+RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{2}z$", re.IGNORECASE)
+EASTERN_TZ = ZoneInfo("America/New_York")
+PRODUCTS = {
+    "confidence": {
+        "label": "Rain Confidence",
+        "filename_prefix": "rain_confidence_f",
+        "empty_message": "Preparing GFS rain confidence PNGs for the viewer.",
+    },
+    "trend": {
+        "label": "Run-to-Run Trend",
+        "filename_prefix": "rain_confidence_trend_f",
+        "empty_message": "Preparing run-to-run confidence trend PNGs for the viewer.",
+    },
+}
 
 
-def build_plot_subtitle(run_cycle: RunCycle, forecast_hour: int, member_count: int) -> str:
-    return (
-        f"Weighted comparison across {member_count} aligned runs | Latest run {run_cycle.tag} "
-        f"has the strongest influence | F{forecast_hour:03d}"
-    )
-
-
-def trend_cmap() -> tuple[ListedColormap, BoundaryNorm]:
-    boundaries = np.array([-100, -75, -50, -25, -1, 1, 25, 50, 75, 100], dtype=np.float32)
-    cmap = ListedColormap(TREND_COLORS, name="confidence_trend")
-    norm = BoundaryNorm(boundaries, cmap.N, clip=True)
-    return cmap, norm
-
-
-def calculate_weighted_trend_percent(
-    members_mmhr: np.ndarray,
-    rain_threshold_mmhr: float,
-) -> np.ndarray:
-    member_count = members_mmhr.shape[0]
-    if member_count < 2:
-        return np.zeros(members_mmhr.shape[1:], dtype=np.float32)
-
-    wet_signal = (members_mmhr >= rain_threshold_mmhr).astype(np.float32)
-    weights = np.linspace(member_count, 1, member_count, dtype=np.float32)
-
-    trend_numerator = np.zeros(members_mmhr.shape[1:], dtype=np.float32)
-    trend_denominator = np.zeros(members_mmhr.shape[1:], dtype=np.float32)
-
-    for newer_index in range(member_count - 1):
-        newer_signal = wet_signal[newer_index]
-        for older_index in range(newer_index + 1, member_count):
-            pair_weight = weights[newer_index] * weights[older_index]
-            pair_delta = newer_signal - wet_signal[older_index]
-            trend_numerator += pair_delta * pair_weight
-            trend_denominator += pair_weight
-
-    trend_ratio = np.divide(
-        trend_numerator,
-        np.maximum(trend_denominator, 1e-6),
-        out=np.zeros_like(trend_numerator),
-        where=trend_denominator > 0,
-    )
-    trend_percent = np.clip(trend_ratio * 100.0, -100.0, 100.0)
-    return trend_percent.astype(np.float32)
-
-
-def collect_comparison_fields(
-    root: Path,
-    run_cycle,
-    forecast_hour: int,
-    history_runs: int,
-    rain_threshold_mmhr: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-    current_sequence = build_run_sequence(run_cycle, history_runs)
-
-    current_members, lats, lons, current_metadata = collect_aligned_members(
-        root,
-        current_sequence,
-        forecast_hour,
-    )
-    mask_rate = np.max(current_members, axis=0)
-    member_count = len(current_metadata)
-    return lats, lons, current_members, mask_rate, member_count
-
-
-def plot_trend_map(
-    save_path: Path,
-    run_cycle,
-    forecast_hour: int,
-    lats: np.ndarray,
-    lons: np.ndarray,
-    trend_percent: np.ndarray,
-    mask_rate: np.ndarray,
-    member_count: int,
-    rain_threshold_mmhr: float,
-    smooth_passes: int,
+def run_scripts(
+    scripts: list[tuple[str, str]],
+    retries: int,
+    parallel: bool = False,
+    max_parallel: int = 3,
 ) -> None:
-    smoothed_change = np.clip(smooth_field(trend_percent, smooth_passes), -100.0, 100.0)
-    smoothed_mask_rate = np.maximum(smooth_field(mask_rate, smooth_passes), 0.0)
-    projected_change = np.ma.masked_where(smoothed_mask_rate < rain_threshold_mmhr, smoothed_change)
-    cmap, norm = trend_cmap()
+    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
 
-    figure = plt.figure(figsize=(15, 9))
-    axis = plt.axes(projection=ccrs.PlateCarree())
-    axis.set_extent(CONUS_EXTENT, crs=ccrs.PlateCarree())
-    axis.coastlines(linewidth=0.7)
-    axis.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.5)
-    axis.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.3)
+    def run_single_script(script_path: str, working_dir: str) -> None:
+        script_name = Path(script_path).stem
+        log_path = LOGS_ROOT / f"{script_name}.log"
+        attempts = max(1, retries)
 
-    filled = axis.contourf(
-        lons,
-        lats,
-        projected_change,
-        levels=np.array([-100, -75, -50, -25, -1, 1, 25, 50, 75, 100], dtype=np.float32),
-        cmap=cmap,
-        norm=norm,
-        extend="both",
-        transform=ccrs.PlateCarree(),
-    )
+        for attempt in range(1, attempts + 1):
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\n[{datetime.now(timezone.utc).isoformat()}] attempt {attempt}\n")
+                completed = subprocess.run(
+                    [sys.executable, script_path],
+                    cwd=working_dir,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
 
-    axis.set_title(
-        build_plot_title(run_cycle, forecast_hour),
-        fontsize=16,
-        color="#3b4a5a",
-        pad=10,
-        loc="left",
-        fontweight="normal",
-    )
-    axis.text(
-        0.01,
-        0.01,
-        build_plot_subtitle(run_cycle, forecast_hour, member_count),
-        transform=axis.transAxes,
-        fontsize=10,
-        color="#304253",
-        ha="left",
-        va="bottom",
-        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
-    )
+            if completed.returncode == 0:
+                return
 
-    colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02)
-    colorbar.set_label("Weighted run-to-run trend (%)")
+        raise RuntimeError(f"Script failed after {attempts} attempts: {script_path}")
 
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(save_path, dpi=160, bbox_inches="tight")
-    plt.close(figure)
+    if parallel and len(scripts) > 1:
+        workers = max(1, min(max_parallel, len(scripts)))
+        threads: list[threading.Thread] = []
+        for script_path, working_dir in scripts:
+            thread = threading.Thread(target=run_single_script, args=(script_path, working_dir), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+            while sum(thread_item.is_alive() for thread_item in threads) >= workers:
+                for thread_item in threads:
+                    thread_item.join(timeout=0.1)
+
+        for thread in threads:
+            thread.join()
+        return
+
+    for script_path, working_dir in scripts:
+        run_single_script(script_path, working_dir)
 
 
-def build_trend_products(
-    root: Path,
-    run_cycle,
-    plot_forecast_hours,
-    history_runs: int,
-    rain_threshold_mmhr: float,
-    smooth_passes: int,
-) -> None:
-    plot_root = root / "plots" / run_cycle.tag
-    for forecast_hour in plot_forecast_hours:
-        lats, lons, members_mmhr, mask_rate, member_count = collect_comparison_fields(
-            root=root,
-            run_cycle=run_cycle,
-            forecast_hour=forecast_hour,
-            history_runs=history_runs,
-            rain_threshold_mmhr=rain_threshold_mmhr,
+def parse_run_id(run_id: str) -> datetime | None:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+
+    try:
+        return datetime.strptime(run_id[:-1], "%Y%m%d_%H").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def resolve_product(product_key: str | None) -> str:
+    if product_key in PRODUCTS:
+        return str(product_key)
+    return "confidence"
+
+
+def get_product_files(run_dir: Path, product_key: str):
+    product = PRODUCTS[product_key]
+    return run_dir.glob(f"{product['filename_prefix']}*.png")
+
+
+def format_run_label(run_id: str) -> str:
+    run_time_utc = parse_run_id(run_id)
+    if run_time_utc is None:
+        return run_id
+
+    run_time_eastern = run_time_utc.astimezone(EASTERN_TZ)
+    return f"{run_time_utc.strftime('%HZ %b %d')} | {run_time_eastern.strftime('%a %I %p %Z')}"
+
+
+def get_run_directory(run_id: str | None) -> Path | None:
+    if not run_id:
+        return None
+    if parse_run_id(run_id) is None:
+        return None
+
+    run_dir = PLOTS_ROOT / run_id
+    if not run_dir.is_dir():
+        return None
+    return run_dir
+
+
+def list_runs(product_key: str = "confidence") -> list[dict[str, str | int | bool]]:
+    run_items: list[dict[str, str | int | bool]] = []
+    if not PLOTS_ROOT.is_dir():
+        return run_items
+
+    for run_dir in sorted(PLOTS_ROOT.iterdir(), key=lambda path: path.name, reverse=True):
+        if not run_dir.is_dir() or parse_run_id(run_dir.name) is None:
+            continue
+
+        image_count = sum(1 for _ in get_product_files(run_dir, product_key))
+        if image_count == 0:
+            continue
+
+        run_items.append(
+            {
+                "id": run_dir.name,
+                "label": format_run_label(run_dir.name),
+                "image_count": image_count,
+            }
         )
-        trend_percent = calculate_weighted_trend_percent(
-            members_mmhr,
-            rain_threshold_mmhr,
-        )
-        save_path = plot_root / f"rain_confidence_trend_f{forecast_hour:03d}.png"
-        plot_trend_map(
-            save_path=save_path,
-            run_cycle=run_cycle,
-            forecast_hour=forecast_hour,
-            lats=lats,
-            lons=lons,
-            trend_percent=trend_percent,
-            mask_rate=mask_rate,
-            member_count=member_count,
-            rain_threshold_mmhr=rain_threshold_mmhr,
-            smooth_passes=smooth_passes,
-        )
-        logging.info("Saved %s", save_path)
+
+    for index, item in enumerate(run_items):
+        item["is_latest"] = index == 0
+
+    return run_items
 
 
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
-    setup_logging(args.log_level)
-    now_utc = dt.datetime.now(tz=UTC)
-    plot_forecast_hours = build_plot_forecast_hours(args.max_plot_forecast_hour)
-    output_root = args.output_root.resolve()
-    client = NomadsClient(
-        timeout=args.request_timeout,
-        min_interval_seconds=args.request_min_interval,
-        max_retries=args.max_request_retries,
+def resolve_run_id(
+    requested_run_id: str | None = None,
+    product_key: str = "confidence",
+) -> str | None:
+    run_items = list_runs(product_key)
+    valid_run_ids = {str(item["id"]) for item in run_items}
+
+    if requested_run_id in valid_run_ids:
+        return requested_run_id
+
+    if run_items:
+        return str(run_items[0]["id"])
+
+    return None
+
+
+def get_run_label(run_id: str | None, product_key: str = "confidence") -> str:
+    if not run_id:
+        return "No saved runs"
+
+    for run in list_runs(product_key):
+        if str(run["id"]) == run_id:
+            return str(run["label"])
+
+    return run_id
+
+
+def list_images(
+    run_id: str | None = None,
+    product_key: str = "confidence",
+) -> tuple[list[dict[str, str | int]], str | None]:
+    resolved_run_id = resolve_run_id(run_id, product_key)
+    image_dir = get_run_directory(resolved_run_id) if resolved_run_id else None
+    if image_dir is None:
+        return [], resolved_run_id
+
+    image_items: list[dict[str, str | int]] = []
+    for image_path in sorted(get_product_files(image_dir, product_key), key=lambda path: path.name):
+        match = PNG_PATTERN.search(image_path.stem)
+        frame = int(match.group(1)) if match else -1
+        stat = image_path.stat()
+        image_items.append(
+            {
+                "filename": image_path.name,
+                "frame": frame,
+                "label": f"Forecast Hour F{frame:03d}" if frame >= 0 else image_path.stem,
+                "url": f"/images/{resolved_run_id}/{image_path.name}?v={int(stat.st_mtime)}",
+            }
+        )
+
+    image_items.sort(key=lambda item: (int(item["frame"]), str(item["filename"])))
+    return image_items, resolved_run_id
+
+
+@app.route("/")
+def index() -> str:
+    selected_product = resolve_product(request.args.get("product"))
+    runs = list_runs(selected_product)
+    requested_run_id = request.args.get("run")
+    images, selected_run = list_images(requested_run_id, selected_product)
+    return render_template(
+        "index.html",
+        images=images,
+        runs=runs,
+        products=[{"id": product_id, **product} for product_id, product in PRODUCTS.items()],
+        selected_product=selected_product,
+        selected_product_label=PRODUCTS[selected_product]["label"],
+        selected_product_empty_message=PRODUCTS[selected_product]["empty_message"],
+        selected_run=selected_run,
+        selected_run_label=get_run_label(selected_run, selected_product),
+        image_count=len(images),
+        plots_root=str(PLOTS_ROOT),
     )
 
-    current_run = resolve_latest_complete_cycle(now_utc, args.cycle_lookback, client)
-    required_run_cycles = build_run_sequence(current_run, args.history_runs)
-    ensure_complete_history(required_run_cycles, client)
 
-    if not args.skip_download:
-        for run_cycle in required_run_cycles:
-            download_run(
-                client=client,
-                root=output_root,
-                run_cycle=run_cycle,
-                forecast_hours=DOWNLOAD_FORECAST_HOURS,
-                overwrite=args.overwrite,
-                workers=args.download_workers,
-            )
-        prune_old_run_directories(output_root / "grib", args.retain_runs)
 
-    build_trend_products(
-        root=output_root,
-        run_cycle=current_run,
-        plot_forecast_hours=plot_forecast_hours,
-        history_runs=args.history_runs,
-        rain_threshold_mmhr=args.rain_threshold_mmhr,
-        smooth_passes=max(0, args.smooth_passes),
+@app.route("/api/runs")
+def api_runs():
+    selected_product = resolve_product(request.args.get("product"))
+    runs = list_runs(selected_product)
+    return jsonify(
+        {
+            "runs": runs,
+            "selected_run": resolve_run_id(request.args.get("run"), selected_product),
+            "selected_product": selected_product,
+        }
     )
-    prune_old_run_directories(output_root / "plots", args.retain_runs)
 
-    logging.info("Finished building trend maps for %s", current_run.tag)
+
+@app.route("/api/images")
+def api_images():
+    selected_product = resolve_product(request.args.get("product"))
+    images, resolved_run_id = list_images(request.args.get("run"), selected_product)
+    return jsonify({"images": images, "run_id": resolved_run_id, "product": selected_product})
+
+
+@app.route("/run-task1")
+def run_task1():
+    scripts = [
+        ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs__confidence_trend.py", "/opt/render/project/src"),
+        
+        
+    ]
+    threading.Thread(
+        target=lambda: run_scripts(scripts, 3, parallel=True, max_parallel=1),
+        daemon=True,
+    ).start()
+    return "Task started in background! Check logs folder for output.", 200
+
+
+@app.route("/images/<run_id>/<path:filename>")
+def serve_image(run_id: str, filename: str):
+    run_dir = get_run_directory(run_id)
+    if run_dir is None:
+        abort(404)
+
+    image_path = (run_dir / filename).resolve()
+    try:
+        image_path.relative_to(run_dir.resolve())
+    except ValueError:
+        abort(404)
+
+    if not image_path.is_file():
+        abort(404)
+
+    return send_from_directory(run_dir, filename)
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
