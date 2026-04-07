@@ -40,16 +40,20 @@ from gfs_rain_confidence import (
 matplotlib.use("Agg")
 
 WIND_CONFIDENCE_COLORS = [
-    "#ffffff",
-    "#eef7ff",
-    "#d7ebff",
-    "#b5d7ff",
-    "#88bcff",
-    "#a59cf7",
-    "#c783ed",
-    "#dd69dc",
-    "#e64fbf",
-    "#b61f7f",
+    "#e0f3ff",  # very light blue
+    "#9bd4ff",  # light blue
+    "#4fa3ff",  # blue
+
+    "#3bd16f",  # green
+    "#7fff00",  # bright green-yellow
+
+    "#ffe600",  # yellow
+    "#ffb300",  # orange
+
+    "#ff4d2d",  # red
+    "#cc1f1a",  # dark red
+
+    "#9b00ff",  # purple (extreme)
 ]
 
 WIND_DOWNLOAD_FORECAST_HOURS = (0,) + tuple(range(6, MAX_DOWNLOAD_FORECAST_HOUR + 1, 6))
