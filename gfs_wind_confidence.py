@@ -392,12 +392,13 @@ def wind_cmap() -> tuple[ListedColormap, BoundaryNorm]:
     return cmap, norm
 
 
-def build_plot_title(run_cycle: RunCycle, forecast_hour: int) -> str:
+def build_plot_title(run_cycle: RunCycle, forecast_hour: int, gust_threshold_mph: float) -> str:
     valid_local = valid_time(run_cycle, forecast_hour).astimezone(EASTERN)
     hour_string = valid_local.strftime("%I:%M %p").lstrip("0")
     day_of_week = valid_local.strftime("%A")
+    threshold_label = f"{gust_threshold_mph:g}+ mph"
     return (
-        f"Wind Gust Confidence Forecast F{forecast_hour:03d}\n"
+        f"Wind Gust Confidence {threshold_label} Forecast F{forecast_hour:03d}\n"
         f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_string} ET"
     )
 
@@ -427,7 +428,7 @@ def plot_wind_map(save_path: Path, run_cycle: RunCycle, forecast_hour: int, lats
     )
 
     axis.set_title(
-        build_plot_title(run_cycle, forecast_hour),
+        build_plot_title(run_cycle, forecast_hour, gust_threshold_mph),
         fontsize=16,
         color="#4d4868",
         pad=10,
