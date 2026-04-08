@@ -181,7 +181,7 @@ def build_plot_title(run_cycle: RunCycle, forecast_hour: int) -> str:
     hour_str_fmt = valid_local.strftime("%I:%M %p").lstrip("0")
     day_of_week = valid_local.strftime("%A")
     return (
-        f"Rain Run-to-Run Consistency F{forecast_hour:03d}\n"
+        f"Precip Run-to-Run Consistency F{forecast_hour:03d}\n"
         f"Valid {day_of_week}, {valid_local.strftime('%b %d, %Y')} at {hour_str_fmt} ET"
     )
 
