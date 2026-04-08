@@ -38,6 +38,11 @@ PRODUCTS = {
         "filename_prefix": "rain_confidence_f",
         "empty_message": "Preparing GFS rain confidence PNGs for the viewer.",
     },
+    "consistency": {
+        "label": "Rain Consistency",
+        "filename_prefix": "rain_consistency_f",
+        "empty_message": "Preparing GFS rain consistency PNGs for the viewer.",
+    },
     "lightning": {
         "label": "Lightning Confidence",
         "filename_prefix": "lightning_confidence_f",
@@ -280,6 +285,7 @@ def api_images():
 def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_rain_consistency.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_lightning_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_wind_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_temperature_average.py", "/opt/render/project/src"),
