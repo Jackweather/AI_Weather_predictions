@@ -39,15 +39,15 @@ from gfs_rain_confidence import (
 matplotlib.use("Agg")
 
 CONSISTENCY_COLOR_ANCHORS = [
-    "#e8f7ff",
-    "#caebf8",
-    "#aadfef",
-    "#84d0e1",
-    "#5fc1ca",
-    "#45b09f",
-    "#339872",
-    "#21794f",
-    "#0f5a31",
+    "#eef8ff",
+    "#77aed3",
+    "#25ebc0",
+    "#03f560",
+    "#bbff00",
+    "#ffed4c",
+    "#faa302",
+    "#ff009d",
+    "#fc0202",
 ]
 
 
@@ -186,13 +186,6 @@ def build_plot_title(run_cycle: RunCycle, forecast_hour: int) -> str:
     )
 
 
-def build_plot_subtitle(run_cycle: RunCycle, forecast_hour: int, member_count: int) -> str:
-    return (
-        f"GFS 0.25deg | Run {run_cycle.tag} | Forecast Hour F{forecast_hour:03d} | "
-        f"Consistent Wet Runs 0-{member_count}"
-    )
-
-
 def consistency_cmap(member_count: int) -> tuple[ListedColormap, BoundaryNorm, np.ndarray]:
     gradient = LinearSegmentedColormap.from_list(
         "rain_consistency_gradient",
@@ -250,15 +243,6 @@ def plot_consistency_map(
         pad=10,
         loc="left",
         fontweight="normal",
-    )
-    axis.text(
-        0.01,
-        0.02,
-        build_plot_subtitle(run_cycle, forecast_hour, member_count),
-        transform=axis.transAxes,
-        fontsize=10,
-        color="#355c62",
-        bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none", "pad": 4},
     )
 
     colorbar = plt.colorbar(filled, ax=axis, shrink=0.82, pad=0.02, ticks=ticks)
