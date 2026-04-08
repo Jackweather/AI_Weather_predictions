@@ -43,6 +43,12 @@ PRODUCTS = {
         "filename_prefix": "rain_consistency_f",
         "empty_message": "Preparing GFS rain consistency PNGs for the viewer.",
     },
+    "verification": {
+        "label": "Rain Verification",
+        "filename_prefix": "rain_verification_f",
+        "empty_message": "Preparing archived rain verification PNGs for the viewer.",
+        "root_name": "verification_plots",
+    },
     "lightning": {
         "label": "Lightning Confidence",
         "filename_prefix": "lightning_confidence_f",
@@ -132,6 +138,12 @@ def resolve_product(product_key: str | None) -> str:
     return "confidence"
 
 
+def get_product_root(product_key: str) -> Path:
+    product = PRODUCTS[product_key]
+    root_name = str(product.get("root_name", "plots"))
+    return (DATA_ROOT / root_name).resolve()
+
+
 def get_product_files(run_dir: Path, product_key: str):
     product = PRODUCTS[product_key]
     return run_dir.glob(f"{product['filename_prefix']}*.png")
@@ -147,12 +159,16 @@ def format_run_label(run_id: str) -> str:
 
 
 def get_run_directory(run_id: str | None) -> Path | None:
+    return get_run_directory_for_product(run_id, "confidence")
+
+
+def get_run_directory_for_product(run_id: str | None, product_key: str) -> Path | None:
     if not run_id:
         return None
     if parse_run_id(run_id) is None:
         return None
 
-    run_dir = PLOTS_ROOT / run_id
+    run_dir = get_product_root(product_key) / run_id
     if not run_dir.is_dir():
         return None
     return run_dir
@@ -160,10 +176,11 @@ def get_run_directory(run_id: str | None) -> Path | None:
 
 def list_runs(product_key: str = "confidence") -> list[dict[str, str | int | bool]]:
     run_items: list[dict[str, str | int | bool]] = []
-    if not PLOTS_ROOT.is_dir():
+    product_root = get_product_root(product_key)
+    if not product_root.is_dir():
         return run_items
 
-    for run_dir in sorted(PLOTS_ROOT.iterdir(), key=lambda path: path.name, reverse=True):
+    for run_dir in sorted(product_root.iterdir(), key=lambda path: path.name, reverse=True):
         if not run_dir.is_dir() or parse_run_id(run_dir.name) is None:
             continue
 
@@ -217,7 +234,7 @@ def list_images(
     product_key: str = "confidence",
 ) -> tuple[list[dict[str, str | int]], str | None]:
     resolved_run_id = resolve_run_id(run_id, product_key)
-    image_dir = get_run_directory(resolved_run_id) if resolved_run_id else None
+    image_dir = get_run_directory_for_product(resolved_run_id, product_key) if resolved_run_id else None
     if image_dir is None:
         return [], resolved_run_id
 
@@ -231,7 +248,7 @@ def list_images(
                 "filename": image_path.name,
                 "frame": frame,
                 "label": f"Forecast Hour F{frame:03d}" if frame >= 0 else image_path.stem,
-                "url": f"/images/{resolved_run_id}/{image_path.name}?v={int(stat.st_mtime)}",
+                "url": f"/images/{product_key}/{resolved_run_id}/{image_path.name}?v={int(stat.st_mtime)}",
             }
         )
 
@@ -286,6 +303,7 @@ def run_task1():
     scripts = [
         ("/opt/render/project/src/gfs_rain_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_rain_consistency.py", "/opt/render/project/src"),
+        ("/opt/render/project/src/gfs_rain_verification.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_lightning_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_wind_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_temperature_average.py", "/opt/render/project/src"),
@@ -300,8 +318,17 @@ def run_task1():
 
 
 @app.route("/images/<run_id>/<path:filename>")
-def serve_image(run_id: str, filename: str):
-    run_dir = get_run_directory(run_id)
+def serve_legacy_image(run_id: str, filename: str):
+    return serve_image("confidence", run_id, filename)
+
+
+@app.route("/images/<product_key>/<run_id>/<path:filename>")
+def serve_image(product_key: str, run_id: str, filename: str):
+    resolved_product = resolve_product(product_key)
+    if resolved_product != product_key:
+        abort(404)
+
+    run_dir = get_run_directory_for_product(run_id, product_key)
     if run_dir is None:
         abort(404)
 
