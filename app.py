@@ -58,11 +58,6 @@ PRODUCTS = {
         "filename_prefix": "tornado_confidence_f",
         "empty_message": "Preparing GFS tornado confidence PNGs for the viewer.",
     },
-    "trend": {
-        "label": "Run-to-Run Trend",
-        "filename_prefix": "rain_confidence_trend_f",
-        "empty_message": "Preparing run-to-run confidence trend PNGs for the viewer.",
-    },
 }
 
 
@@ -289,7 +284,7 @@ def run_task1():
         ("/opt/render/project/src/gfs_wind_confidence.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_temperature_average.py", "/opt/render/project/src"),
         ("/opt/render/project/src/gfs_tornado_confidence.py", "/opt/render/project/src"),
-        ("/opt/render/project/src/gfs_confidence_trend.py", "/opt/render/project/src"),
+        
     ]
     threading.Thread(
         target=lambda: run_scripts(scripts, 6, parallel=True, max_parallel=1),
