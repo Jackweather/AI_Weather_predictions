@@ -311,7 +311,7 @@ def run_task1():
         
     ]
     threading.Thread(
-        target=lambda: run_scripts(scripts, 6, parallel=True, max_parallel=1),
+        target=lambda: run_scripts(scripts, 7, parallel=True, max_parallel=1),
         daemon=True,
     ).start()
     return "Task started in background! Check logs folder for output.", 200
